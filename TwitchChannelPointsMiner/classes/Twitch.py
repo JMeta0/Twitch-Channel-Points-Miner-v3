@@ -6037,11 +6037,21 @@ class Twitch(object):
             daemon=True,
         ).start()
 
+    def __clear_prompt_claim_debounce(self, drop_instance_id):
+        # The debounce entry is written optimistically, before the claim is
+        # known to succeed. If it never actually ran (lock contention) or
+        # failed (exception), clear it so a near-term retry - the next
+        # minute-watched tick that still sees the drop at 100% - isn't
+        # blocked for the full PROMPT_CLAIM_DEBOUNCE_SECONDS window.
+        with self.prompt_claim_lock:
+            self.prompt_claim_last.pop(drop_instance_id, None)
+
     def __run_prompt_claim(self, drop, campaign):
         if not self.prompt_claim_pass_lock.acquire(blocking=False):
             logger.info(
                 "Prompt claim skipped; an inventory claim pass is already running"
             )
+            self.__clear_prompt_claim_debounce(drop.drop_instance_id)
             return
         try:
             logger.info(
@@ -6054,6 +6064,7 @@ class Twitch(object):
                 "Prompt claim after drop capture failed; the sync cycle will retry",
                 exc_info=True,
             )
+            self.__clear_prompt_claim_debounce(drop.drop_instance_id)
         finally:
             self.prompt_claim_pass_lock.release()
 

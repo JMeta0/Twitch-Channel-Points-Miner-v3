@@ -1681,7 +1681,33 @@ def test_prompt_claim_skips_while_another_claim_pass_is_running(monkeypatch):
     finally:
         twitch.prompt_claim_pass_lock.release()
 
-    # The debounce still records the drop, but the claim pass is skipped while
-    # another one is running (the sync cycle covers it).
+    # Nothing was actually claimed (another pass was running), so the
+    # optimistically-recorded debounce entry must be cleared rather than
+    # blocking a retry for the full debounce window - the sync cycle covering
+    # it happens on its own ~30-minute cadence, independent of this debounce.
     assert claimed == []
-    assert set(twitch.prompt_claim_last) == {"instance-1"}
+    assert twitch.prompt_claim_last == {}
+
+
+def test_prompt_claim_clears_debounce_when_claim_raises(monkeypatch):
+    twitch_module = importlib.import_module("TwitchChannelPointsMiner.classes.Twitch")
+    monkeypatch.setattr(twitch_module, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        Twitch,
+        "claim_all_drops_from_inventory",
+        lambda self: (_ for _ in ()).throw(RuntimeError("transient failure")),
+    )
+    twitch = object.__new__(Twitch)
+    twitch.prompt_claim_lock = Lock()
+    twitch.prompt_claim_pass_lock = Lock()
+    twitch.prompt_claim_last = {}
+    drop = SimpleNamespace(
+        name="Reward", minutes_required=10, drop_instance_id="instance-1"
+    )
+    campaign = SimpleNamespace(id="campaign-1", name="Example campaign")
+
+    twitch._Twitch__claim_completed_drop_promptly(drop, campaign)
+
+    # The claim attempt failed, so the debounce entry must not block a
+    # near-term retry.
+    assert twitch.prompt_claim_last == {}
