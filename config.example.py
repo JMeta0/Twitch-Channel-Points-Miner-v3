@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copy this template to config/config.py and review each setting before use.
 
-CONFIG_VERSION = 8
+CONFIG_VERSION = 9
 
 import logging
 from colorama import Fore
