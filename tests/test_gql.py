@@ -1,4 +1,5 @@
 import importlib
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from threading import Event
@@ -1367,6 +1368,42 @@ def test_category_filter_preserves_unconfigured_wildcard_deadlines(monkeypatch):
     assert twitch.category_campaign_deadlines["predecessor"] == datetime(2099, 1, 1)
     assert twitch.category_campaign_deadlines["inventory-game"] == datetime(2099, 2, 1)
     assert "expired-game" not in twitch.category_campaign_deadlines
+
+
+def test_category_filter_prunes_requested_category_whose_campaign_ended(monkeypatch):
+    twitch = twitch_with_gql(SimpleNamespace())
+    twitch.category_campaign_eligibility = {}
+    twitch.category_log_level = logging.INFO
+    twitch.category_campaign_deadlines = {
+        # "ended-game" is still configured (requested) but Twitch no longer
+        # reports an active campaign for it this cycle -- its old, not-yet-
+        # elapsed deadline must not linger just because the timestamp itself
+        # hasn't passed.
+        "ended-game": datetime(2099, 1, 1),
+        "unrequested-game": datetime(2099, 1, 1),
+    }
+    monkeypatch.setattr(
+        Twitch,
+        "_Twitch__get_inventory",
+        lambda self: {"gameEventDrops": []},
+    )
+    monkeypatch.setattr(
+        Twitch,
+        "_Twitch__active_drop_category_slugs_from_campaigns",
+        lambda self, inventory, requested: ({}, set()),
+    )
+    monkeypatch.setattr(
+        Twitch,
+        "_Twitch__twitchdrops_app_fallback",
+        lambda self, categories, known_slugs: {},
+    )
+
+    twitch.filter_categories_with_active_drops(["ended-game"])
+
+    assert "ended-game" not in twitch.category_campaign_deadlines
+    assert twitch.category_campaign_deadlines["unrequested-game"] == datetime(
+        2099, 1, 1
+    )
 
 
 @pytest.mark.parametrize(

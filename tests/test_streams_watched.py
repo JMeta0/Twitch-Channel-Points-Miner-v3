@@ -1153,6 +1153,40 @@ def test_drop_pick_survives_transient_eligibility_failure(monkeypatch):
     assert posted == ["https://spade.test/current-pick"]
 
 
+def test_drop_pick_transient_hold_releases_when_drop_cannot_finish(monkeypatch):
+    # The transient-eligibility hold must apply the same feasibility check as
+    # the stickiness hold: an in-progress drop that cannot finish before its
+    # campaign deadline must not keep the previous pick's watch slot right up
+    # until the deadline passes.
+    current = _watch_streamer(
+        "current-pick", from_wildcard_category=True, drops_eligible=True
+    )
+    current.drops_condition = lambda: False
+    current.stream.game_name = lambda: "Current Game"
+    challenger = _watch_streamer(
+        "challenger", from_wildcard_category=True, drops_eligible=True
+    )
+    challenger.stream.game_name = lambda: "Challenger Game"
+
+    posted = _run_one_watch_iteration(
+        monkeypatch,
+        [current, challenger],
+        streams_watched=1,
+        priority=[Priority.DROPS],
+        # Needs 5 minutes (current=10, required=15) but the deadline is only
+        # 2 minutes away: the drop cannot finish in time.
+        category_campaign_deadlines={
+            "current-game": datetime.utcnow() + timedelta(minutes=2)
+        },
+        drop_pick_stickiness_minutes=15,
+        last_drop_pick_streamer="current-pick",
+        drop_inventory_progress={"current-game": _drop_progress(current=10)},
+        now=1_700_000_000,
+    )
+
+    assert posted == ["https://spade.test/challenger"]
+
+
 def test_drop_pick_not_held_when_campaign_left_inventory(monkeypatch):
     # With no in-progress drop for its game, the transient hold must not keep
     # an otherwise ineligible streamer in the watch rotation.

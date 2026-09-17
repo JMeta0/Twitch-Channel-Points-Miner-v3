@@ -2361,14 +2361,20 @@ class Twitch(object):
         # and the drop pick would flip between real deadlines and "no known
         # deadline" as the passes alternate. Preserve wildcard entries this
         # evaluation didn't cover, prune expired ones, and let the fresh
-        # evaluation win for games it did cover.
+        # evaluation win for games it did cover. A requested slug absent from
+        # active_category_deadlines was covered by this pass and found to
+        # have no active campaign, so it must not be preserved even though
+        # it's also absent -- otherwise a campaign that just ended keeps its
+        # old deadline until that timestamp elapses on its own.
         now = datetime.utcnow()
         preserved_deadlines = {
             game_slug: deadline
             for game_slug, deadline in (
                 getattr(self, "category_campaign_deadlines", None) or {}
             ).items()
-            if deadline > now and game_slug not in active_category_deadlines
+            if deadline > now
+            and game_slug not in active_category_deadlines
+            and game_slug not in requested_category_slugs
         }
         preserved_deadlines.update(active_category_deadlines)
         self.category_campaign_deadlines = preserved_deadlines
@@ -2752,12 +2758,24 @@ class Twitch(object):
         if stream is None:
             return False
         game_slug = self.__slugify(stream.game_name() or "")
-        if self.__in_progress_drop_needs(game_slug) is None:
+        needs = self.__in_progress_drop_needs(game_slug)
+        if needs is None:
             return False
+        needs_minutes, _drop_name = needs
         deadline = (getattr(self, "category_campaign_deadlines", None) or {}).get(
             game_slug
         )
-        return deadline is None or deadline > datetime.utcnow()
+        # No known deadline: hold, mirroring _hold_reason's no-deadline branch
+        # (there is nothing to check feasibility against). With a deadline,
+        # only hold while the in-progress drop can still finish in time --
+        # otherwise this would keep the slot on a channel whose drop
+        # mathematically cannot complete until the deadline passes on its own.
+        if deadline is None:
+            return True
+        if deadline <= datetime.utcnow():
+            return False
+        minutes_to_deadline = (deadline - datetime.utcnow()).total_seconds() / 60
+        return needs_minutes <= minutes_to_deadline
 
     def __log_category_drop_pick(
         self,
@@ -6059,7 +6077,11 @@ class Twitch(object):
                     campaigns_update = time.time()
 
                     # TEMPORARY AUTO DROP CLAIMING FIX
-                    self.claim_all_drops_from_inventory()
+                    # Share prompt_claim_pass_lock with __run_prompt_claim so a
+                    # background prompt claim and this periodic pass can never
+                    # run claim_all_drops_from_inventory concurrently.
+                    with self.prompt_claim_pass_lock:
+                        self.claim_all_drops_from_inventory()
                     #####################################
 
                     # Expand dashboard campaigns together with exact campaigns
