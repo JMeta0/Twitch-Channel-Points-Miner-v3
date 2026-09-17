@@ -1128,13 +1128,27 @@ def test_drop_pick_survives_transient_eligibility_failure(monkeypatch):
     # an in-progress drop in the inventory, the pick must not rotate to
     # another campaign. The failure is transient state, not a disabled
     # claim_drops setting - the hold requires claims to stay enabled.
+    #
+    # from_category=True is set here (in addition to from_wildcard_category)
+    # to match real Streamer construction - wildcard streamers always also
+    # carry from_category=True - because the streamers_index eligibility gate
+    # only applies its __drops_condition/__previous_pick_still_farming check
+    # to from_category=True streamers. Without it, this test would pass
+    # trivially by bypassing the gate entirely rather than exercising the
+    # rescue path it's meant to cover.
     current = _watch_streamer(
-        "current-pick", from_wildcard_category=True, drops_eligible=True
+        "current-pick",
+        from_category=True,
+        from_wildcard_category=True,
+        drops_eligible=True,
     )
     current.drops_condition = lambda: False
     current.stream.game_name = lambda: "Current Game"
     challenger = _watch_streamer(
-        "challenger", from_wildcard_category=True, drops_eligible=True
+        "challenger",
+        from_category=True,
+        from_wildcard_category=True,
+        drops_eligible=True,
     )
     challenger.stream.game_name = lambda: "Challenger Game"
 
@@ -1151,6 +1165,47 @@ def test_drop_pick_survives_transient_eligibility_failure(monkeypatch):
     )
 
     assert posted == ["https://spade.test/current-pick"]
+
+
+def test_badge_campaign_streamer_does_not_steal_preferred_category_slot(monkeypatch):
+    # A badge-campaign streamer can also carry from_category=True in
+    # production (badge-campaign streamers are built with from_category=True,
+    # from_badge_campaign=True). Category-candidate selection must key off
+    # tier membership (indexes_by_source[CATEGORIES]), not the from_category
+    # attribute alone - otherwise a badge stream with an earlier-looking
+    # deadline can win the shared discovered slot and the trim loop (which
+    # does use tier membership) evicts the real category candidate instead,
+    # since it no longer matches kept_discovered_index.
+    badge = _watch_streamer(
+        "badge-streamer",
+        from_category=True,
+        from_badge_campaign=True,
+        drops_eligible=True,
+    )
+    category = _watch_streamer(
+        "category-streamer", from_category=True, drops_eligible=True
+    )
+
+    posted = _run_one_watch_iteration(
+        monkeypatch,
+        [badge, category],
+        streams_watched=2,
+        priority=[Priority.DROPS],
+        source_priority=[StreamerSource.BADGES, StreamerSource.CATEGORIES],
+        # The badge stream's deadline looks more urgent than the real
+        # category candidate's - under the bug, min(category_candidates, ...)
+        # picks the badge streamer as kept_discovered_index and the trim loop
+        # evicts the real category candidate.
+        category_campaign_deadlines={
+            "badge-streamer": datetime.utcnow() + timedelta(minutes=1),
+            "category-streamer": datetime.utcnow() + timedelta(minutes=60),
+        },
+    )
+
+    assert set(posted) == {
+        "https://spade.test/badge-streamer",
+        "https://spade.test/category-streamer",
+    }
 
 
 def test_drop_pick_transient_hold_releases_when_drop_cannot_finish(monkeypatch):

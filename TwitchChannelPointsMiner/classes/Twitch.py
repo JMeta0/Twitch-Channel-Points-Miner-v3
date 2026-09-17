@@ -3701,6 +3701,14 @@ class Twitch(object):
                         getattr(streamers_snapshot[i], "from_category", False)
                         is not True
                         or self.__drops_condition(streamers_snapshot[i]) is True
+                        # A transient per-channel eligibility failure must not
+                        # exclude the previous drop pick before the rescue
+                        # check below (Priority.DROPS) ever gets to see it -
+                        # without this, __previous_pick_still_farming's
+                        # streamer was already filtered out here and the
+                        # rescue path could never run.
+                        or self.__previous_pick_still_farming(streamers_snapshot[i])
+                        is True
                     )
                     and (
                         streamers_snapshot[i].online_at == 0
@@ -4066,21 +4074,18 @@ class Twitch(object):
                     ),
                 )[:max_watch_amount]
 
-                def _is_preferred_category(index):
-                    streamer = streamers_snapshot[index]
-                    return (
-                        getattr(streamer, "from_category", False) is True
-                        and getattr(streamer, "from_wildcard_category", False)
-                        is not True
-                    )
-
-                def _is_wildcard_category(index):
-                    return (
-                        getattr(
-                            streamers_snapshot[index], "from_wildcard_category", False
-                        )
-                        is True
-                    )
+                # Tier membership (not the from_category/from_wildcard_category
+                # attributes alone) decides who can win the shared discovered
+                # slot below and who the later trim loop evicts - a
+                # BADGES-source streamer can also carry from_category=True, so
+                # an attribute-only check here let a badge stream win the slot
+                # and then evade the trim loop (which already used tier
+                # membership), silently dropping a genuine category/wildcard
+                # candidate for the whole cycle.
+                preferred_tier = set(indexes_by_source[StreamerSource.CATEGORIES])
+                wildcard_tier = set(
+                    indexes_by_source[StreamerSource.WILDCARD_CATEGORIES]
+                )
 
                 # Safety net: never watch more than one discovered ("not
                 # explicitly chosen by the user") Drops stream per cycle in
@@ -4093,16 +4098,13 @@ class Twitch(object):
                 # shared slot over a wildcard one, matching their relative
                 # source_priority; only when there's no preferred-category
                 # candidate does the soonest-expiring wildcard one get it.
-                category_candidates = list(indexes_by_source[StreamerSource.CATEGORIES])
 
                 # Final choice per tier: min() by expiration, but keep the
                 # previously picked streamer while it is still within the
                 # stickiness margin (the tier ordering above already fronted
                 # it for slot allocation).
                 category_candidates = [
-                    index
-                    for index in streamers_watching
-                    if _is_preferred_category(index)
+                    index for index in streamers_watching if index in preferred_tier
                 ]
                 best_category_index = (
                     min(category_candidates, key=category_expiration)
@@ -4141,9 +4143,7 @@ class Twitch(object):
                 )
 
                 wildcard_category_candidates = [
-                    index
-                    for index in streamers_watching
-                    if _is_wildcard_category(index)
+                    index for index in streamers_watching if index in wildcard_tier
                 ]
                 best_wildcard_category_index = (
                     min(wildcard_category_candidates, key=category_expiration)
@@ -4199,13 +4199,10 @@ class Twitch(object):
                 )
 
                 # Only discovered category/wildcard tier members are trimmed
-                # here - membership in the tier lists, not the from_category
-                # flag alone, since a BADGES-source streamer can also carry
+                # here - membership in the tier lists (preferred_tier /
+                # wildcard_tier, defined above), not the from_category flag
+                # alone, since a BADGES-source streamer can also carry
                 # from_category=True.
-                preferred_tier = set(indexes_by_source[StreamerSource.CATEGORIES])
-                wildcard_tier = set(
-                    indexes_by_source[StreamerSource.WILDCARD_CATEGORIES]
-                )
                 filtered_streamers_watching = []
                 for index in streamers_watching:
                     if (
