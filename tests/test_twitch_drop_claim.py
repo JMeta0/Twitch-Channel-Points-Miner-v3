@@ -1682,9 +1682,9 @@ def test_prompt_claim_skips_while_another_claim_pass_is_running(monkeypatch):
         twitch.prompt_claim_pass_lock.release()
 
     # Nothing was actually claimed (another pass was running), so the
-    # optimistically-recorded debounce entry must be cleared rather than
-    # blocking a retry for the full debounce window - the sync cycle covering
-    # it happens on its own ~30-minute cadence, independent of this debounce.
+    # optimistically-recorded debounce entry must be cleared rather than left
+    # behind unusable - the sync cycle still covers this drop on its own
+    # ~30-minute cadence, independent of this debounce.
     assert claimed == []
     assert twitch.prompt_claim_last == {}
 
@@ -1708,6 +1708,6 @@ def test_prompt_claim_clears_debounce_when_claim_raises(monkeypatch):
 
     twitch._Twitch__claim_completed_drop_promptly(drop, campaign)
 
-    # The claim attempt failed, so the debounce entry must not block a
-    # near-term retry.
+    # The claim attempt failed, so the debounce entry must be cleared rather
+    # than left behind unusable.
     assert twitch.prompt_claim_last == {}

@@ -352,7 +352,8 @@ class TwitchChannelPointsMiner:
         streamer_settings: StreamerSettings = StreamerSettings(),
         streams_watched: int = 2,
         gql: AttemptStrategy | GQLFactory | None = None,
-        streamer_source_priority: list | tuple = (
+        streamer_source_priority: list
+        | tuple = (
             StreamerSource.STREAMERS,
             StreamerSource.FOLLOWERS,
             StreamerSource.CATEGORIES,
@@ -1597,6 +1598,14 @@ class TwitchChannelPointsMiner:
                 continue
 
             streamer.from_badge_campaign = False
+            # from_category was only ever True because this was a badge
+            # campaign (see the badge-streamer construction site above) - not
+            # because it was discovered via category browsing. Reset it too,
+            # or a retained ex-badge streamer permanently misclassifies as a
+            # real category-discovery streamer in every from_category check
+            # from here on (streamer_source(), eligibility, the shared
+            # discovered-slot arbitration).
+            streamer.from_category = False
             if streamer.explicitly_configured or streamer.from_followers:
                 retained.append(streamer)
                 retained_baselines.append(baseline)

@@ -6052,10 +6052,14 @@ class Twitch(object):
 
     def __clear_prompt_claim_debounce(self, drop_instance_id):
         # The debounce entry is written optimistically, before the claim is
-        # known to succeed. If it never actually ran (lock contention) or
-        # failed (exception), clear it so a near-term retry - the next
-        # minute-watched tick that still sees the drop at 100% - isn't
-        # blocked for the full PROMPT_CLAIM_DEBOUNCE_SECONDS window.
+        # known to succeed. The call site (__claim_completed_drop_promptly's
+        # caller) is edge-triggered on drop_progress_last_saved, which
+        # saturates on the same tick that triggers it, so this can't be
+        # re-entered for the same drop - there is no near-term retry through
+        # this path either way. Clearing here just avoids leaving an unusable
+        # entry behind when lock contention or an exception meant nothing was
+        # actually claimed; the real fallback is still the periodic
+        # sync_campaigns claim pass, same as before this debounce existed.
         with self.prompt_claim_lock:
             self.prompt_claim_last.pop(drop_instance_id, None)
 
