@@ -1,4 +1,5 @@
 import logging
+import sys
 from logging.handlers import TimedRotatingFileHandler
 
 import pytest
@@ -116,3 +117,49 @@ def test_configured_loggers_redact_urllib3_request_lines(tmp_path, monkeypatch):
     assert "sig=<redacted>&token=<redacted>" in contents
     assert "leaked-signature" not in contents
     assert "leaked-token" not in contents
+
+
+def test_sensitive_url_filter_redacts_tracebacks_and_stack_info():
+    url = "https://usher.ttvnw.net/api/channel/hls/x.m3u8?sig=leaked-sig&token=leaked"
+    try:
+        raise ValueError(f"Max retries exceeded with url: {url}")
+    except ValueError:
+        record = logging.LogRecord(
+            "x", 30, __file__, 1, "Unable to poll", None, sys.exc_info()
+        )
+    record.stack_info = f"Stack (most recent call last):\n  fetching {url}"
+
+    SensitiveUrlFilter().filter(record)
+    formatted = logging.Formatter().format(record)
+
+    assert "ValueError: Max retries exceeded" in formatted
+    assert "leaked" not in formatted
+    assert "sig=<redacted>&token=<redacted>" in formatted
+
+
+def test_configured_loggers_redact_exception_tracebacks(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = LoggerSettings(file_level=logging.DEBUG)
+    root_logger = logging.getLogger()
+    existing_handlers = set(root_logger.handlers)
+    existing_level = root_logger.level
+
+    log_file, listener = configure_loggers("test-user", settings)
+    try:
+        try:
+            raise ConnectionError(
+                "GET /v1/playlist/SIGNEDPLAYLIST.m3u8?sig=leaked-sig failed"
+            )
+        except ConnectionError:
+            logging.getLogger("segments").warning("Unable to poll", exc_info=True)
+    finally:
+        listener.stop()
+        for handler in set(root_logger.handlers) - existing_handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        root_logger.setLevel(existing_level)
+
+    contents = open(log_file, encoding="utf-8").read()
+    assert "ConnectionError" in contents
+    assert "SIGNEDPLAYLIST" not in contents
+    assert "leaked-sig" not in contents
