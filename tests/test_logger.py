@@ -3,7 +3,11 @@ from logging.handlers import TimedRotatingFileHandler
 
 import pytest
 
-from TwitchChannelPointsMiner.logger import LoggerSettings, configure_loggers
+from TwitchChannelPointsMiner.logger import (
+    LoggerSettings,
+    SensitiveUrlFilter,
+    configure_loggers,
+)
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, 1.5, "7"])
@@ -36,3 +40,79 @@ def test_file_logs_rotate_at_midnight_with_configured_retention(tmp_path, monkey
         for handler in set(root_logger.handlers) - existing_handlers:
             root_logger.removeHandler(handler)
         root_logger.setLevel(existing_level)
+
+
+def _filtered_message(msg, *args):
+    record = logging.LogRecord("urllib3.connectionpool", 10, __file__, 1, msg, args, None)
+    assert SensitiveUrlFilter().filter(record) is True
+    return record.getMessage()
+
+
+def test_sensitive_url_filter_redacts_usher_signature_and_token():
+    message = _filtered_message(
+        '%s://%s:%s "%s %s %s" %s %s',
+        "https",
+        "usher.ttvnw.net",
+        443,
+        "GET",
+        "/api/channel/hls/example.m3u8?sig=abc123&token=%7B%22secret%22%7D",
+        "HTTP/1.1",
+        200,
+        None,
+    )
+
+    assert "abc123" not in message
+    assert "secret" not in message
+    assert "/api/channel/hls/example.m3u8?sig=<redacted>&token=<redacted>" in message
+
+
+def test_sensitive_url_filter_redacts_signed_playlist_and_segment_paths():
+    playlist = _filtered_message('"GET /v1/playlist/CqSIGNED.m3u8 HTTP/1.1" 200 None')
+    segment = _filtered_message('"HEAD /s1/v1/segment/CtoSIGNED?dna=XYZ HTTP/1.1" 200 0')
+
+    assert playlist == '"GET /v1/playlist/<redacted> HTTP/1.1" 200 None'
+    assert segment == '"HEAD /s1/v1/segment/<redacted> HTTP/1.1" 200 0'
+
+
+def test_sensitive_url_filter_leaves_other_messages_untouched():
+    record = logging.LogRecord(
+        "x", 20, __file__, 1, "Watching %s for %s", ("alice", "drops"), None
+    )
+
+    SensitiveUrlFilter().filter(record)
+
+    assert record.args == ("alice", "drops")
+    assert record.getMessage() == "Watching alice for drops"
+
+
+def test_configured_loggers_redact_urllib3_request_lines(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = LoggerSettings(file_level=logging.DEBUG)
+    root_logger = logging.getLogger()
+    existing_handlers = set(root_logger.handlers)
+    existing_level = root_logger.level
+
+    log_file, listener = configure_loggers("test-user", settings)
+    try:
+        logging.getLogger("urllib3.connectionpool").debug(
+            '%s://%s:%s "%s %s %s" %s %s',
+            "https",
+            "usher.ttvnw.net",
+            443,
+            "GET",
+            "/api/channel/hls/example.m3u8?sig=leaked-signature&token=leaked-token",
+            "HTTP/1.1",
+            200,
+            None,
+        )
+    finally:
+        listener.stop()
+        for handler in set(root_logger.handlers) - existing_handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        root_logger.setLevel(existing_level)
+
+    contents = open(log_file, encoding="utf-8").read()
+    assert "sig=<redacted>&token=<redacted>" in contents
+    assert "leaked-signature" not in contents
+    assert "leaked-token" not in contents

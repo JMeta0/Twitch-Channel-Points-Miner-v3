@@ -2,6 +2,7 @@ import logging
 import os
 import platform
 import queue
+import re
 import sys
 from datetime import datetime
 from logging.handlers import QueueHandler, QueueListener, TimedRotatingFileHandler
@@ -177,6 +178,36 @@ class CategoryConsoleFilter(logging.Filter):
         return record.levelno >= self.global_level or getattr(
             record, "category_log", False
         )
+
+
+class SensitiveUrlFilter(logging.Filter):
+    """Redact signed Twitch playback credentials from every log record.
+
+    Third-party loggers such as urllib3 log each request line at DEBUG, which
+    for stream segment polling includes the usher playlist's ``sig`` and
+    ``token`` query values and the signed media playlist and segment paths.
+    """
+
+    PATTERNS = (
+        (re.compile(r"([?&](?:sig|token)=)[^&\s\"']+"), r"\1<redacted>"),
+        (re.compile(r"(/v1/(?:playlist|segment)/)[^\s\"']+"), r"\1<redacted>"),
+    )
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if "=" not in message and "/v1/" not in message:
+            return True
+
+        redacted = message
+        for pattern, replacement in self.PATTERNS:
+            redacted = pattern.sub(replacement, redacted)
+        if redacted != message:
+            record.msg = redacted
+            record.args = None
+        return True
 
 
 class FileFormatter(logging.Formatter):
@@ -363,6 +394,8 @@ def configure_loggers(username, settings):
     # Queue handler that will handle the logger queue
     logger_queue = queue.Queue(-1)
     queue_handler = QueueHandler(logger_queue)
+    # Redact before the record is queued, so no handler ever sees credentials.
+    queue_handler.addFilter(SensitiveUrlFilter())
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     # Add the queue handler to the root logger
