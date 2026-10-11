@@ -3894,14 +3894,17 @@ class Twitch(object):
 
         return points_limit >= 0 and channel_points >= points_limit
 
-    def _poll_stream_segments(self, streamer):
+    def _poll_stream_segments(self, streamer, drop_stream):
         """Request the watched stream's HLS segments so Twitch counts watch time.
 
         Twitch only credits Drop progress while a stream's media segments are
         requested, so this polls the (cached) media playlist and HEADs every
-        new segment, but only for streams with Drops to earn. The poll runs on
-        a background thread so slow Twitch or CDN responses never delay the
-        watch loop. State is kept per streamer and reset when the broadcast
+        new segment, but only for streams with Drops to earn. ``drop_stream``
+        is the watch loop's own Drops decision for this stream (the one used
+        to fill the Drops slot), so category, wildcard and badge picks whose
+        Stream campaigns Twitch did not populate are still covered. The poll
+        runs on a background thread so slow Twitch or CDN responses never
+        delay the watch loop. State is kept per streamer and reset when the broadcast
         changes; missing on lightweight test doubles, where it is a no-op.
         Unexpected errors are logged and swallowed so they cannot abort the
         remaining streamers in the watch cycle.
@@ -3911,11 +3914,10 @@ class Twitch(object):
         if watchers is None or gql is None:
             return
 
-        try:
-            drops_condition = getattr(streamer, "drops_condition", None)
-            if drops_condition is None or drops_condition() is not True:
-                return
+        if drop_stream is not True:
+            return
 
+        try:
             stream = getattr(streamer, "stream", None)
             broadcast_id = getattr(stream, "broadcast_id", None)
             watcher = watchers.get(streamer.username)
@@ -4833,7 +4835,7 @@ class Twitch(object):
                     except requests.exceptions.Timeout as e:
                         logger.error(f"Error while trying to send minute watched: {e}")
 
-                    self._poll_stream_segments(streamer)
+                    self._poll_stream_segments(streamer, _is_drop_stream(index))
 
                     self.__chuncked_sleep(
                         next_iteration - time.time(), chunk_size=chunk_size

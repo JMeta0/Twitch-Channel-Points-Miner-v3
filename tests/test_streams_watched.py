@@ -2037,12 +2037,49 @@ def test_watch_iteration_polls_stream_segments_for_watched_streamers(monkeypatch
     monkeypatch.setattr(
         Twitch,
         "_poll_stream_segments",
-        lambda self, streamer: polled.append(streamer.username),
+        lambda self, streamer, drop_stream: polled.append(
+            (streamer.username, drop_stream)
+        ),
     )
 
     _run_one_watch_iteration(monkeypatch, streamers, streams_watched=2)
 
-    assert polled == ["alpha", "bravo"]
+    # Points-only streams are passed through with drop_stream=False.
+    assert polled == [("alpha", False), ("bravo", False)]
+
+
+def test_watch_iteration_marks_category_pick_as_drop_stream(monkeypatch):
+    # A category-discovered Drops pick whose Stream campaigns Twitch did not
+    # populate still fills the Drops slot, so its segments must be polled even
+    # though the entity-level drops_condition() is False.
+    category = _watch_streamer(
+        "category-streamer", from_category=True, drops_eligible=True
+    )
+    # The harness seeds category eligibility from drops_condition(); after
+    # that, model Twitch's private campaign query leaving Stream.campaigns
+    # empty so the entity-level check is False.
+    seed_eligibility = iter([True])
+    category.drops_condition = lambda: next(seed_eligibility, False)
+    streamers = [category, _watch_streamer("points-streamer")]
+    polled = {}
+    monkeypatch.setattr(
+        Twitch,
+        "_poll_stream_segments",
+        lambda self, streamer, drop_stream: polled.__setitem__(
+            streamer.username, drop_stream
+        ),
+    )
+
+    _run_one_watch_iteration(
+        monkeypatch,
+        streamers,
+        streams_watched=2,
+        priority=[Priority.ORDER],
+        source_priority=[StreamerSource.CATEGORIES, StreamerSource.STREAMERS],
+    )
+
+    assert polled["category-streamer"] is True
+    assert polled["points-streamer"] is False
 
 
 def _segment_twitch():
@@ -2053,11 +2090,9 @@ def _segment_twitch():
     return twitch
 
 
-def _segment_streamer(username="alice", broadcast_id="broadcast-1", drops=True):
+def _segment_streamer(username="alice", broadcast_id="broadcast-1"):
     return SimpleNamespace(
-        username=username,
-        stream=SimpleNamespace(broadcast_id=broadcast_id),
-        drops_condition=lambda: drops,
+        username=username, stream=SimpleNamespace(broadcast_id=broadcast_id)
     )
 
 
@@ -2073,19 +2108,19 @@ def test_poll_stream_segments_manages_watcher_lifecycle(monkeypatch):
     twitch = _segment_twitch()
     streamer = _segment_streamer()
 
-    twitch._poll_stream_segments(streamer)
+    twitch._poll_stream_segments(streamer, True)
     watcher = twitch.stream_segment_watchers["alice"]
     assert isinstance(watcher, StreamSegmentWatcher)
     assert watcher.broadcast_id == "broadcast-1"
     assert started == [watcher]
 
     # Same broadcast reuses the watcher (and its dedup state).
-    twitch._poll_stream_segments(streamer)
+    twitch._poll_stream_segments(streamer, True)
     assert twitch.stream_segment_watchers["alice"] is watcher
 
     # A new broadcast resets the watcher.
     streamer.stream.broadcast_id = "broadcast-2"
-    twitch._poll_stream_segments(streamer)
+    twitch._poll_stream_segments(streamer, True)
     assert twitch.stream_segment_watchers["alice"] is not watcher
     assert twitch.stream_segment_watchers["alice"].broadcast_id == "broadcast-2"
 
@@ -2101,7 +2136,7 @@ def test_poll_stream_segments_skips_streams_without_drops(monkeypatch):
     )
     twitch = _segment_twitch()
 
-    twitch._poll_stream_segments(_segment_streamer(drops=False))
+    twitch._poll_stream_segments(_segment_streamer(), False)
 
     assert twitch.stream_segment_watchers == {}
     assert started == []
@@ -2115,7 +2150,7 @@ def test_poll_stream_segments_is_noop_without_gql():
         username="alice", stream=SimpleNamespace(broadcast_id="broadcast-1")
     )
 
-    twitch._poll_stream_segments(streamer)
+    twitch._poll_stream_segments(streamer, True)
 
     assert twitch.stream_segment_watchers == {}
 
@@ -2341,16 +2376,21 @@ def test_pending_watch_streak_keeps_a_second_drop_stream_when_streaks_prioritize
     ]
 
 
-def test_poll_stream_segments_logs_and_swallows_unexpected_errors(caplog):
-    def boom():
+def test_poll_stream_segments_logs_and_swallows_unexpected_errors(
+    monkeypatch, caplog
+):
+    from TwitchChannelPointsMiner.classes.StreamSegmentWatcher import (
+        StreamSegmentWatcher,
+    )
+
+    def boom(self, now=None):
         raise ValueError("unexpected")
 
+    monkeypatch.setattr(StreamSegmentWatcher, "start_poll", boom)
     twitch = _segment_twitch()
-    streamer = _segment_streamer()
-    streamer.drops_condition = boom
 
     with caplog.at_level("WARNING"):
-        twitch._poll_stream_segments(streamer)
+        twitch._poll_stream_segments(_segment_streamer(), True)
 
     assert any(
         "Unable to request stream segments" in record.getMessage()
