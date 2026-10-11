@@ -3922,6 +3922,8 @@ class Twitch(object):
             broadcast_id = getattr(stream, "broadcast_id", None)
             watcher = watchers.get(streamer.username)
             if watcher is None or not watcher.matches_broadcast(broadcast_id):
+                if watcher is not None:
+                    watcher.close()
                 watcher = StreamSegmentWatcher(
                     streamer.username,
                     gql,
@@ -3949,6 +3951,7 @@ class Twitch(object):
         for username, watcher in list(watchers.items()):
             if watcher.is_idle(now):
                 del watchers[username]
+                watcher.close()
 
     def send_minute_watched_events(
         self,
@@ -4705,6 +4708,15 @@ class Twitch(object):
                     streamers_snapshot, streamers_watching, streamer_source
                 )
 
+                # Segment requests are what earn Drop progress now, so start
+                # every watched stream's (background) poll before the
+                # minute-watched requests: an unexpected error there aborts
+                # the rest of this cycle and must not skip them.
+                for index in streamers_watching:
+                    self._poll_stream_segments(
+                        streamers_snapshot[index], _is_drop_stream(index)
+                    )
+
                 for index in streamers_watching:
                     # next_iteration = time.time() + 60 / len(streamers_watching)
                     next_iteration = time.time() + 20 / len(streamers_watching)
@@ -4834,8 +4846,6 @@ class Twitch(object):
                         self.__check_connection_handler(chunk_size)
                     except requests.exceptions.Timeout as e:
                         logger.error(f"Error while trying to send minute watched: {e}")
-
-                    self._poll_stream_segments(streamer, _is_drop_stream(index))
 
                     self.__chuncked_sleep(
                         next_iteration - time.time(), chunk_size=chunk_size

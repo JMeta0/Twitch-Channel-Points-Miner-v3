@@ -2048,6 +2048,30 @@ def test_watch_iteration_polls_stream_segments_for_watched_streamers(monkeypatch
     assert polled == [("alpha", False), ("bravo", False)]
 
 
+def test_minute_watched_error_does_not_skip_segment_polling(monkeypatch):
+    streamers = [
+        _watch_streamer("alpha", explicitly_configured=True),
+        _watch_streamer("bravo", explicitly_configured=True),
+    ]
+    polled = []
+    monkeypatch.setattr(
+        Twitch,
+        "_poll_stream_segments",
+        lambda self, streamer, drop_stream: polled.append(streamer.username),
+    )
+
+    # The first spade POST raises an error the per-streamer handler does not
+    # catch, which aborts the rest of the cycle.
+    _run_one_watch_iteration(
+        monkeypatch,
+        streamers,
+        streams_watched=2,
+        post_side_effects=[ValueError("unexpected")],
+    )
+
+    assert polled == ["alpha", "bravo"]
+
+
 def test_watch_iteration_marks_category_pick_as_drop_stream(monkeypatch):
     # A category-discovered Drops pick whose Stream campaigns Twitch did not
     # populate still fills the Drops slot, so its segments must be polled even
@@ -2118,11 +2142,32 @@ def test_poll_stream_segments_manages_watcher_lifecycle(monkeypatch):
     twitch._poll_stream_segments(streamer, True)
     assert twitch.stream_segment_watchers["alice"] is watcher
 
-    # A new broadcast resets the watcher.
+    # A new broadcast resets the watcher and releases the old one's session.
+    closed = []
+    monkeypatch.setattr(StreamSegmentWatcher, "close", lambda self: closed.append(self))
     streamer.stream.broadcast_id = "broadcast-2"
     twitch._poll_stream_segments(streamer, True)
     assert twitch.stream_segment_watchers["alice"] is not watcher
     assert twitch.stream_segment_watchers["alice"].broadcast_id == "broadcast-2"
+    assert closed == [watcher]
+
+
+def test_poll_stream_segments_keeps_watcher_when_broadcast_id_loads(monkeypatch):
+    from TwitchChannelPointsMiner.classes.StreamSegmentWatcher import (
+        StreamSegmentWatcher,
+    )
+
+    monkeypatch.setattr(StreamSegmentWatcher, "start_poll", lambda self, now=None: None)
+    twitch = _segment_twitch()
+    streamer = _segment_streamer(broadcast_id=None)
+
+    twitch._poll_stream_segments(streamer, True)
+    watcher = twitch.stream_segment_watchers["alice"]
+    streamer.stream.broadcast_id = "broadcast-1"
+    twitch._poll_stream_segments(streamer, True)
+
+    assert twitch.stream_segment_watchers["alice"] is watcher
+    assert watcher.broadcast_id == "broadcast-1"
 
 
 def test_poll_stream_segments_skips_streams_without_drops(monkeypatch):
@@ -2401,10 +2446,13 @@ def test_poll_stream_segments_logs_and_swallows_unexpected_errors(
 
 def test_idle_stream_segment_watchers_are_forgotten():
     twitch = _segment_twitch()
+    closed = []
     active = SimpleNamespace(is_idle=lambda now=None: False)
     idle = SimpleNamespace(is_idle=lambda now=None: True)
+    idle.close = lambda: closed.append("idle")
     twitch.stream_segment_watchers = {"active": active, "idle": idle}
 
     twitch._forget_idle_stream_segment_watchers()
 
     assert twitch.stream_segment_watchers == {"active": active}
+    assert closed == ["idle"]

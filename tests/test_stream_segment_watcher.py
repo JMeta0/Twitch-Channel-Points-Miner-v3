@@ -28,6 +28,13 @@ MEDIA_PLAYLIST = (
 )
 
 
+def _patch_session(monkeypatch, method, fake):
+    """Route a watcher's keep-alive session ``method`` to ``fake(url, **kw)``."""
+    monkeypatch.setattr(
+        requests.Session, method, lambda self, url, **kwargs: fake(url, **kwargs)
+    )
+
+
 class FakeResponse:
     def __init__(self, status_code, text=""):
         self.status_code = status_code
@@ -93,7 +100,7 @@ def _route_get(monkeypatch, media_responses, master_response=None):
         assert media_queue, "unexpected extra media playlist request"
         return media_queue.pop(0)
 
-    monkeypatch.setattr(requests, "get", fake_get)
+    _patch_session(monkeypatch, "get", fake_get)
     return calls
 
 
@@ -104,7 +111,7 @@ def _patch_head(monkeypatch, status=200):
         head_calls.append(url)
         return FakeResponse(status)
 
-    monkeypatch.setattr(requests, "head", fake_head)
+    _patch_session(monkeypatch, "head", fake_head)
     return head_calls
 
 
@@ -142,7 +149,7 @@ def test_poll_targets_last_master_variant(monkeypatch):
         requested["media"] = url
         return FakeResponse(200, MEDIA_PLAYLIST)
 
-    monkeypatch.setattr(requests, "get", fake_get)
+    _patch_session(monkeypatch, "get", fake_get)
     _patch_head(monkeypatch)
     watcher = StreamSegmentWatcher(
         "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
@@ -154,8 +161,8 @@ def test_poll_targets_last_master_variant(monkeypatch):
 
 
 def test_poll_skips_forbidden_playback_token(monkeypatch):
-    monkeypatch.setattr(
-        requests, "get", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+    _patch_session(
+        monkeypatch, "get", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
     )
     head_calls = _patch_head(monkeypatch)
     watcher = StreamSegmentWatcher(
@@ -171,7 +178,7 @@ def test_poll_skips_forbidden_playback_token(monkeypatch):
 
 
 def test_poll_records_master_playlist_failure_reason(monkeypatch):
-    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(503))
+    _patch_session(monkeypatch, "get", lambda *a, **k: FakeResponse(503))
     _patch_head(monkeypatch)
     watcher = StreamSegmentWatcher(
         "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
@@ -193,7 +200,7 @@ def test_poll_retries_failed_segment_on_next_cycle(monkeypatch):
         head_calls.append(url)
         return FakeResponse(next(statuses))
 
-    monkeypatch.setattr(requests, "head", fake_head)
+    _patch_session(monkeypatch, "head", fake_head)
     watcher = StreamSegmentWatcher(
         "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
     )
@@ -246,7 +253,7 @@ def test_network_failure_stops_requesting_remaining_segments(monkeypatch):
         head_calls.append(url)
         raise requests.exceptions.ConnectTimeout()
 
-    monkeypatch.setattr(requests, "head", fake_head)
+    _patch_session(monkeypatch, "head", fake_head)
     watcher = StreamSegmentWatcher(
         "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
     )
@@ -289,7 +296,7 @@ def _serve_live_stream(monkeypatch):
         state["sequence"] += 10
         return FakeResponse(200, _live_playlist(state["sequence"]))
 
-    monkeypatch.setattr(requests, "get", fake_get)
+    _patch_session(monkeypatch, "get", fake_get)
     return state
 
 
@@ -461,7 +468,7 @@ def test_evicted_segment_404_keeps_playlist_and_continues(monkeypatch):
         head_calls.append(url)
         return FakeResponse(next(statuses))
 
-    monkeypatch.setattr(requests, "head", fake_head)
+    _patch_session(monkeypatch, "head", fake_head)
     watcher = StreamSegmentWatcher(
         "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
     )
@@ -518,7 +525,7 @@ def test_segment_head_follows_redirects_and_accepts_any_2xx(monkeypatch):
         head_kwargs.append(kwargs)
         return FakeResponse(206)
 
-    monkeypatch.setattr(requests, "head", fake_head)
+    _patch_session(monkeypatch, "head", fake_head)
     watcher = StreamSegmentWatcher(
         "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
     )
@@ -526,3 +533,89 @@ def test_segment_head_follows_redirects_and_accepts_any_2xx(monkeypatch):
     assert watcher.poll(now=1000) is True
     assert all(kwargs.get("allow_redirects") is True for kwargs in head_kwargs)
     assert len(watcher.seen_segments) == 2
+
+
+def test_evicted_segment_404_is_not_requested_again(monkeypatch):
+    _route_get(
+        monkeypatch,
+        [FakeResponse(200, MEDIA_PLAYLIST), FakeResponse(200, MEDIA_PLAYLIST)],
+    )
+    statuses = iter([404, 200])
+    head_calls = []
+
+    def fake_head(url, **kwargs):
+        head_calls.append(url)
+        return FakeResponse(next(statuses))
+
+    _patch_session(monkeypatch, "head", fake_head)
+    watcher = StreamSegmentWatcher(
+        "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
+    )
+
+    watcher.poll(now=1000)
+    # The playlist still lists the evicted segment, but it is not re-HEADed.
+    assert watcher.poll(now=1020) is False
+    assert head_calls == [
+        "https://cdn.example/hls/example/0.ts",
+        "https://cdn.example/hls/example/1.ts",
+    ]
+
+
+def test_server_error_segment_is_still_retried(monkeypatch):
+    _route_get(
+        monkeypatch,
+        [FakeResponse(200, MEDIA_PLAYLIST), FakeResponse(200, MEDIA_PLAYLIST)],
+    )
+    statuses = iter([503, 200, 200])
+    head_calls = []
+
+    def fake_head(url, **kwargs):
+        head_calls.append(url)
+        return FakeResponse(next(statuses))
+
+    _patch_session(monkeypatch, "head", fake_head)
+    watcher = StreamSegmentWatcher(
+        "example", SimpleNamespace(get_playback_access_token=lambda _u: _token()), "ua"
+    )
+
+    watcher.poll(now=1000)
+    assert watcher.poll(now=1020) is True
+    assert head_calls[-1] == "https://cdn.example/hls/example/0.ts"
+
+
+def test_requests_share_one_keep_alive_session_with_user_agent():
+    watcher = StreamSegmentWatcher("example", SimpleNamespace(), "test-agent")
+
+    assert isinstance(watcher.session, requests.Session)
+    assert watcher.session.headers["User-Agent"] == "test-agent"
+
+
+def test_close_releases_session_unless_a_poll_is_running(monkeypatch):
+    import threading
+
+    closed = []
+    monkeypatch.setattr(requests.Session, "close", lambda self: closed.append(self))
+    release = threading.Event()
+    monkeypatch.setattr(
+        StreamSegmentWatcher, "poll", lambda self, now=None: release.wait(5)
+    )
+    watcher = StreamSegmentWatcher("example", SimpleNamespace(), "ua")
+
+    worker = watcher.start_poll(now=1000)
+    watcher.close()
+    assert closed == []
+
+    release.set()
+    worker.join(5)
+    watcher.close()
+    assert closed == [watcher.session]
+
+
+def test_unknown_broadcast_id_is_adopted_not_treated_as_new():
+    watcher = StreamSegmentWatcher("example", SimpleNamespace(), "ua")
+
+    assert watcher.matches_broadcast("broadcast-1") is True
+    assert watcher.broadcast_id == "broadcast-1"
+    # Briefly missing stream info is not a new broadcast either.
+    assert watcher.matches_broadcast(None) is True
+    assert watcher.matches_broadcast("broadcast-2") is False

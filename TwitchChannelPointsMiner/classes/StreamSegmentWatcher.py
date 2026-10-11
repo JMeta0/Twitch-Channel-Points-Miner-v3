@@ -74,6 +74,7 @@ class StreamSegmentWatcher(object):
         "segments_missed",
         "playlist_lengths",
         "worker",
+        "session",
     ]
 
     def __init__(self, username, gql, user_agent, broadcast_id=None):
@@ -100,9 +101,31 @@ class StreamSegmentWatcher(object):
         self.segments_missed = 0
         self.playlist_lengths = []
         self.worker = None
+        # One keep-alive session per watcher: every playlist and segment
+        # request goes to the same CDN hosts, so reuse their connections
+        # (only one poll runs at a time, so it is never shared concurrently).
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = user_agent
 
     def matches_broadcast(self, broadcast_id):
+        """Whether ``broadcast_id`` is still the broadcast this watcher tracks.
+
+        An unknown ID on either side is not a new broadcast: stream info often
+        loads after the first poll, so a watcher created before it adopts the
+        real ID instead of being replaced (losing its seen segments and stall
+        state).
+        """
+        if broadcast_id is None:
+            return True
+        if self.broadcast_id is None:
+            self.broadcast_id = broadcast_id
+            return True
         return self.broadcast_id == broadcast_id
+
+    def close(self):
+        """Release pooled connections unless a poll is still using them."""
+        if self.worker is None or not self.worker.is_alive():
+            self.session.close()
 
     def is_idle(self, now=None):
         now = time.time() if now is None else now
@@ -219,20 +242,25 @@ class StreamSegmentWatcher(object):
                 requested = True
                 continue
 
-            # Leave a failed segment unseen so it is retried while the
-            # rolling playlist window still lists it.
             self.segments_failed += 1
             if status is None:
                 # A timeout or connection error will most likely repeat for
-                # the remaining segments; stop so the serial watch loop is not
-                # held up for one timeout per segment.
+                # the remaining segments; stop rather than wait out one
+                # timeout per segment on this poll. The segment stays unseen
+                # so it is retried while the playlist window still lists it.
                 self.last_failure = "segment request failed"
                 break
 
             self.last_failure = f"segment HTTP {status}"
-            # A 404 only means this segment already left the edge cache; the
-            # playlist itself is still valid, so move on to the next one.
-            if status != 404 and status in EXPIRED_STATUS_CODES:
+            if status == 404:
+                # The segment already left the edge cache and will never come
+                # back; remember it so later polls do not request it again.
+                # The playlist itself is still valid.
+                self._remember(segment)
+                continue
+            # Other failures (5xx, 429) leave the segment unseen so it is
+            # retried while the rolling playlist window still lists it.
+            if status in EXPIRED_STATUS_CODES:
                 # The signed URLs expired; the rest of this playlist would
                 # fail the same way until it is re-resolved.
                 self._forget_playlist_if_expired(status, now, resolved_now)
@@ -424,11 +452,7 @@ class StreamSegmentWatcher(object):
 
     def _get(self, url, timeout):
         try:
-            return requests.get(
-                url,
-                headers={"User-Agent": self.user_agent},
-                timeout=timeout,
-            )
+            return self.session.get(url, timeout=timeout)
         except requests.exceptions.RequestException as error:
             # Only the type: the message can carry the signed URL.
             logger.debug("Stream playlist request failed (%s)", type(error).__name__)
@@ -438,11 +462,8 @@ class StreamSegmentWatcher(object):
         try:
             # HEAD does not follow redirects by default; follow them so a CDN
             # redirect to an edge node still reaches (and counts) the segment.
-            response = requests.head(
-                url,
-                headers={"User-Agent": self.user_agent},
-                timeout=SEGMENT_TIMEOUT,
-                allow_redirects=True,
+            response = self.session.head(
+                url, timeout=SEGMENT_TIMEOUT, allow_redirects=True
             )
             return response.status_code
         except requests.exceptions.RequestException as error:
