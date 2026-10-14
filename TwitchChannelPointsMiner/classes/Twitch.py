@@ -79,6 +79,10 @@ DROP_INVENTORY_FRESHNESS_SECONDS = 180
 # provisional eligibility. Discovered streams are re-checked about every two
 # minutes, so this only lapses when the channel query keeps failing.
 CHANNEL_VERDICT_FRESHNESS_SECONDS = 600
+# Consecutive failed campaign queries after which a provisional wildcard
+# channel is ruled out until a query succeeds, so category refreshes stop
+# re-seeding it as eligible after every failure.
+CHANNEL_QUERY_FAILURE_LIMIT = 3
 # How long an inventory snapshot's per-drop progress may be applied to a
 # channel's advertised campaigns. Inventory syncs run every few minutes but can
 # be six apart, so DROP_INVENTORY_FRESHNESS_SECONDS would lapse between syncs
@@ -132,6 +136,7 @@ class Twitch(object):
         "category_campaign_eligibility",
         "category_campaign_eligibility_lock",
         "category_channel_verdicts",
+        "channel_query_failures",
         "category_campaign_deadlines",
         "last_category_drop_selection",
         "last_wildcard_category_drop_selection",
@@ -223,6 +228,9 @@ class Twitch(object):
         self.campaign_detail_attempts = set()
         self.category_campaign_eligibility = {}
         self.category_channel_verdicts = {}
+        # (game_slug, login) -> (consecutive failed campaign queries, time of
+        # the last one) for a provisional wildcard channel.
+        self.channel_query_failures = {}
         self.category_campaign_deadlines = {}
         self.last_category_drop_selection = None
         self.last_wildcard_category_drop_selection = None
@@ -353,6 +361,39 @@ class Twitch(object):
             if eligibility[0] == 0:
                 verdicts[key] = (eligibility, now)
             self.category_channel_verdicts = verdicts
+
+    def __count_channel_query_failure(self, game_slug, login):
+        """Count a failed campaign query for a channel and return how many
+        failed in a row. Failures more than CHANNEL_VERDICT_FRESHNESS_SECONDS
+        apart do not count as consecutive, and such old entries are pruned."""
+        key = (game_slug, login)
+        now = time.time()
+        stale_before = now - CHANNEL_VERDICT_FRESHNESS_SECONDS
+        with self.__eligibility_lock():
+            # Defensive getattr: some tests construct Twitch via __new__ and
+            # skip __init__.
+            failures = {
+                failure_key: entry
+                for failure_key, entry in (
+                    getattr(self, "channel_query_failures", None) or {}
+                ).items()
+                if entry[1] >= stale_before
+            }
+            count = failures.get(key, (0, now))[0] + 1
+            failures[key] = (count, now)
+            self.channel_query_failures = failures
+        return count
+
+    def __reset_channel_query_failures(self, game_slug, login):
+        key = (game_slug, login)
+        if key not in (getattr(self, "channel_query_failures", None) or {}):
+            return
+        with self.__eligibility_lock():
+            self.channel_query_failures = {
+                failure_key: entry
+                for failure_key, entry in self.channel_query_failures.items()
+                if failure_key != key
+            }
 
     def __replace_category_campaign_eligibility(
         self, game_slug: str, eligibility_by_login: dict
@@ -5325,6 +5366,8 @@ class Twitch(object):
             campaign_data_available,
             channel_query_answered,
         ) = self.__get_campaigns_from_channel_id(streamer.channel_id)
+        if channel_query_answered:
+            self.__reset_channel_query_failures(game_slug, streamer.username)
         for campaign in channel_campaigns:
             if not isinstance(campaign, dict):
                 continue
@@ -5506,14 +5549,22 @@ class Twitch(object):
             # enter the watch pool unless Twitch advertises the campaign on the
             # selected live channel. The advertised-campaign branch above has
             # already returned when that verification succeeded.
-            if channel_query_answered:
+            failures = (
+                0
+                if channel_query_answered
+                else self.__count_channel_query_failure(game_slug, streamer.username)
+            )
+            if channel_query_answered or failures >= CHANNEL_QUERY_FAILURE_LIMIT:
+                # A single failed query is not a verdict, but one that keeps
+                # failing is treated as one: otherwise every category refresh
+                # re-seeds the channel as eligible and it can briefly take
+                # the Drops slot.
                 self.__record_channel_verdict(
                     game_slug, streamer.username, (0, len(fallback_campaigns))
                 )
             else:
-                # A failed query is not a verdict. An older positive verdict
-                # left in place is harmless: only negative verdicts outrank
-                # discovery's seed.
+                # An older positive verdict left in place is harmless: only
+                # negative verdicts outrank discovery's seed.
                 with self.__eligibility_lock():
                     self.category_campaign_eligibility[
                         (game_slug, streamer.username)
