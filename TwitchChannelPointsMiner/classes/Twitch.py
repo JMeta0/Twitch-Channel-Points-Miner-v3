@@ -75,6 +75,16 @@ logger = logging.getLogger(__name__)
 JsonType = Dict[str, Any]
 CHANNEL_POINTS_MAX_CONCURRENCY = 3
 DROP_INVENTORY_FRESHNESS_SECONDS = 180
+# How long a per-channel campaign check result outranks category discovery's
+# provisional eligibility. Discovered streams are re-checked about every two
+# minutes, so this only lapses when the channel query keeps failing.
+CHANNEL_VERDICT_FRESHNESS_SECONDS = 600
+# How long an inventory snapshot's per-drop progress may be applied to a
+# channel's advertised campaigns. Inventory syncs run every few minutes but can
+# be six apart, so DROP_INVENTORY_FRESHNESS_SECONDS would lapse between syncs
+# and flip a nearly finished campaign between eligible and not. A drop claimed
+# after the snapshot can only be miscounted for this long.
+INVENTORY_PROGRESS_OVERLAY_SECONDS = 900
 PROMPT_CLAIM_DEBOUNCE_SECONDS = 300
 
 
@@ -97,6 +107,7 @@ class Twitch(object):
         "drop_report_state",
         "drop_inventory_progress",
         "drop_inventory_progress_updated_at",
+        "drop_inventory_minutes_by_drop_id",
         "drop_watch_health",
         "track_drop_item_art",
         "scrape_drop_progress_on_load",
@@ -117,6 +128,7 @@ class Twitch(object):
         "campaign_detail_attempts",
         "category_campaign_eligibility",
         "category_campaign_eligibility_lock",
+        "category_channel_verdicts",
         "category_campaign_deadlines",
         "last_category_drop_selection",
         "last_wildcard_category_drop_selection",
@@ -180,6 +192,7 @@ class Twitch(object):
         self.drop_report_state = {}
         self.drop_inventory_progress = {}
         self.drop_inventory_progress_updated_at = 0
+        self.drop_inventory_minutes_by_drop_id = {}
         self.drop_watch_health = {}
         self.track_drop_item_art = False
         self.scrape_drop_progress_on_load = False
@@ -204,6 +217,7 @@ class Twitch(object):
         self.campaign_channel_ids = {}
         self.campaign_detail_attempts = set()
         self.category_campaign_eligibility = {}
+        self.category_channel_verdicts = {}
         self.category_campaign_deadlines = {}
         self.last_category_drop_selection = None
         self.last_wildcard_category_drop_selection = None
@@ -269,7 +283,7 @@ class Twitch(object):
         self.running = False
 
     def __log_drop_check(self, message, level=logging.INFO):
-        if self.log_drop_checks is True:
+        if getattr(self, "log_drop_checks", False) is True:
             logger.log(level, f"[drops-check] {message}")
 
     def __log_drop_check_json(
@@ -301,11 +315,68 @@ class Twitch(object):
             self.category_campaign_eligibility_lock = lock
         return lock
 
+    def __record_channel_verdict(self, game_slug, login, eligibility):
+        """Store the per-channel campaign check's eligibility for a channel.
+
+        Category discovery only seeds provisional counts. A negative verdict
+        is kept separately so a later discovery pass cannot overwrite what
+        Twitch just said about the channel - doing so made channels Twitch had
+        ruled out look eligible after every category refresh, briefly stealing
+        the Drops slot until their next stream refresh. A positive verdict
+        only clears an earlier negative one, since discovery's seed is just as
+        positive. Expired verdicts are pruned here, so games that drop out of
+        discovery do not leave entries behind.
+        """
+        key = (game_slug, login)
+        now = time.time()
+        with self.__eligibility_lock():
+            self.category_campaign_eligibility[key] = eligibility
+            fresh_after = now - CHANNEL_VERDICT_FRESHNESS_SECONDS
+            verdicts = {
+                verdict_key: verdict
+                for verdict_key, verdict in (
+                    getattr(self, "category_channel_verdicts", None) or {}
+                ).items()
+                if verdict_key != key and verdict[1] >= fresh_after
+            }
+            if eligibility[0] == 0:
+                verdicts[key] = (eligibility, now)
+            self.category_channel_verdicts = verdicts
+
     def __replace_category_campaign_eligibility(
         self, game_slug: str, eligibility_by_login: dict
     ):
-        """Atomically replace cached eligibility for one game category."""
+        """Atomically replace cached eligibility for one game category.
+
+        A fresh per-channel verdict (see __record_channel_verdict, which only
+        keeps negative ones) outranks the discovery seed for a login that is
+        still discovered. Verdicts for logins no
+        longer discovered are dropped with their eligibility; a channel that
+        is rediscovered later is re-checked when it is added again.
+        """
         with self.__eligibility_lock():
+            verdicts = getattr(self, "category_channel_verdicts", None) or {}
+            now = time.time()
+            fresh_after = now - CHANNEL_VERDICT_FRESHNESS_SECONDS
+            fresh_verdicts = {
+                key: verdict
+                for key, verdict in verdicts.items()
+                if key[0] == game_slug
+                and key[1] in eligibility_by_login
+                and verdict[1] >= fresh_after
+            }
+            eligibility_by_login = {
+                login: (
+                    fresh_verdicts[(game_slug, login)][0]
+                    if (game_slug, login) in fresh_verdicts
+                    else eligibility
+                )
+                for login, eligibility in eligibility_by_login.items()
+            }
+            self.category_channel_verdicts = {
+                key: verdict for key, verdict in verdicts.items() if key[0] != game_slug
+            }
+            self.category_channel_verdicts.update(fresh_verdicts)
             updated_eligibility = {
                 key: value
                 for key, value in self.category_campaign_eligibility.items()
@@ -323,6 +394,18 @@ class Twitch(object):
                 evaluated_categories = set()
                 self.evaluated_category_campaigns = evaluated_categories
             evaluated_categories.add(game_slug)
+
+        if fresh_verdicts:
+            self.__log_drop_check(
+                f"Category refresh kept channel check results for {game_slug}: "
+                + ", ".join(
+                    f"{login} {eligibility} checked {now - checked_at:.0f}s ago"
+                    for (_, login), (eligibility, checked_at) in sorted(
+                        fresh_verdicts.items()
+                    )
+                ),
+                level=logging.DEBUG,
+            )
 
     def __drop_tracking_key(self, drop, campaign_name=None, category_name=None):
         return "|".join(
@@ -413,7 +496,56 @@ class Twitch(object):
             game_slug: tuple(sorted(progress))
             for game_slug, progress in progress_by_game.items()
         }
+        self.drop_inventory_minutes_by_drop_id = {
+            drop_id: current
+            for progress in progress_by_game.values()
+            for (_, _, drop_id, _, current, _, _) in progress
+            if drop_id
+        }
         self.drop_inventory_progress_updated_at = time.time()
+
+    def __with_inventory_drop_progress(self, campaign: dict) -> dict:
+        """Return the campaign with the account's inventory progress applied.
+
+        A channel's advertised campaigns carry no per-account "self" data, so
+        every drop looks unwatched there: once a campaign's remaining drops
+        need more minutes than are left, it looked impossible to finish even
+        though the account was already most of the way through them. Fill in
+        the in-progress minutes the latest inventory snapshot reported for the
+        same drop IDs, while that snapshot is recent enough (see
+        INVENTORY_PROGRESS_OVERLAY_SECONDS): an old snapshot can still list a
+        drop that has since been claimed.
+        """
+        updated_at = getattr(self, "drop_inventory_progress_updated_at", 0)
+        if (
+            not updated_at
+            or (time.time() - updated_at) > INVENTORY_PROGRESS_OVERLAY_SECONDS
+        ):
+            return campaign
+        minutes_by_drop_id = (
+            getattr(self, "drop_inventory_minutes_by_drop_id", None) or {}
+        )
+        if not minutes_by_drop_id:
+            return campaign
+
+        changed = False
+        drops = []
+        for drop in campaign.get("timeBasedDrops", []) or []:
+            drop_id = str(drop.get("id") or "") if isinstance(drop, dict) else ""
+            if drop_id in minutes_by_drop_id and not isinstance(drop.get("self"), dict):
+                drop = {
+                    **drop,
+                    "self": {
+                        "isClaimed": False,
+                        "hasPreconditionsMet": True,
+                        "currentMinutesWatched": minutes_by_drop_id[drop_id],
+                    },
+                }
+                changed = True
+            drops.append(drop)
+        if not changed:
+            return campaign
+        return {**campaign, "timeBasedDrops": drops}
 
     @staticmethod
     def __drop_progress_label(progress) -> str:
@@ -3152,7 +3284,9 @@ class Twitch(object):
             extra={"emoji": ":dart:", "event": Events.DROP_STATUS},
         )
 
-    def __log_watched_streamers(self, streamers, streamers_watching, streamer_source):
+    def __log_watched_streamers(
+        self, streamers, streamers_watching, streamer_source, is_drop_stream
+    ):
         def watch_reason(index):
             source = streamer_source(index)
             if source == StreamerSource.BADGES:
@@ -3173,7 +3307,10 @@ class Twitch(object):
 
         for index in streamers_watching:
             streamer = streamers[index]
-            if self.__drops_condition(streamer) is not True:
+            # Use the watch loop's own Drops-slot decision, so a discovered
+            # pick held through a transient eligibility miss is still
+            # reported as watched for drops.
+            if not is_drop_stream(index):
                 continue
 
             campaigns = self.__describe_campaigns(streamer.stream.campaigns)
@@ -4705,7 +4842,10 @@ class Twitch(object):
                 )
 
                 self.__log_watched_streamers(
-                    streamers_snapshot, streamers_watching, streamer_source
+                    streamers_snapshot,
+                    streamers_watching,
+                    streamer_source,
+                    is_drop_stream=_is_drop_stream,
                 )
 
                 # Segment requests are what earn Drop progress now, so start
@@ -5134,7 +5274,11 @@ class Twitch(object):
                 continue
             if (
                 self.__active_incomplete_drop_deadline(
-                    campaign, set(), set(), set(), log_status=False
+                    self.__with_inventory_drop_progress(campaign),
+                    set(),
+                    set(),
+                    set(),
+                    log_status=False,
                 )
                 is None
             ):
@@ -5218,10 +5362,9 @@ class Twitch(object):
                 and fallback_campaigns
                 and not advertised_campaigns
             ):
-                with self.__eligibility_lock():
-                    self.category_campaign_eligibility[
-                        (game_slug, streamer.username)
-                    ] = (0, len(fallback_campaigns))
+                self.__record_channel_verdict(
+                    game_slug, streamer.username, (0, len(fallback_campaigns))
+                )
                 self.__log_drop_check(
                     f"Skipping provisional wildcard channel "
                     f"'{streamer.username}' for {streamer.stream.game_name()}: "
@@ -5245,7 +5388,7 @@ class Twitch(object):
                     for campaign in advertised_campaigns
                     if str(campaign.get("id")) not in self.completed_drop_campaigns
                     and self.__active_incomplete_drop_deadline(
-                        campaign,
+                        self.__with_inventory_drop_progress(campaign),
                         completed_drop_ids,
                         awarded_benefit_ids,
                         awarded_benefit_fingerprints,
@@ -5255,10 +5398,11 @@ class Twitch(object):
                     )
                     is not None
                 )
-                with self.__eligibility_lock():
-                    self.category_campaign_eligibility[
-                        (game_slug, streamer.username)
-                    ] = (eligible_campaigns, len(advertised_campaigns))
+                self.__record_channel_verdict(
+                    game_slug,
+                    streamer.username,
+                    (eligible_campaigns, len(advertised_campaigns)),
+                )
 
             return [str(campaign["id"]) for campaign in advertised_campaigns]
 
@@ -5292,11 +5436,18 @@ class Twitch(object):
             # enter the watch pool unless Twitch advertises the campaign on the
             # selected live channel. The advertised-campaign branch above has
             # already returned when that verification succeeded.
-            with self.__eligibility_lock():
-                self.category_campaign_eligibility[(game_slug, streamer.username)] = (
-                    0,
-                    len(fallback_campaigns),
+            if channel_query_answered:
+                self.__record_channel_verdict(
+                    game_slug, streamer.username, (0, len(fallback_campaigns))
                 )
+            else:
+                # A failed query is not a verdict. An older positive verdict
+                # left in place is harmless: only negative verdicts outrank
+                # discovery's seed.
+                with self.__eligibility_lock():
+                    self.category_campaign_eligibility[
+                        (game_slug, streamer.username)
+                    ] = (0, len(fallback_campaigns))
             self.__log_drop_check(
                 f"Skipping provisional wildcard channel '{streamer.username}' "
                 f"for {streamer.stream.game_name()}: Twitch did not advertise "
@@ -5309,10 +5460,7 @@ class Twitch(object):
                 fallback_campaigns == [] and not allowlisted_elsewhere
             ):
                 if is_drop_discovered(streamer):
-                    with self.__eligibility_lock():
-                        self.category_campaign_eligibility[
-                            (game_slug, streamer.username)
-                        ] = (0, 0)
+                    self.__record_channel_verdict(game_slug, streamer.username, (0, 0))
                 self.__log_drop_check(
                     f"Twitch channel '{streamer.username}' advertises no active "
                     f"campaign for {streamer.stream.game_name()}",
@@ -5324,12 +5472,12 @@ class Twitch(object):
                 # Twitch can omit an account-ineligible campaign from the
                 # channel response even though its official Drops-enabled
                 # directory entry and the external campaign index made it
-                # eligible for discovery. Keep that fallback result instead
-                # of replacing it with (0, 0).
+                # eligible for discovery. Resolve the fallback campaigns below
+                # instead of recording (0, 0).
                 self.__log_drop_check(
                     f"Twitch channel '{streamer.username}' did not expose the "
-                    f"fallback campaign for {streamer.stream.game_name()}; keeping "
-                    "category discovery eligibility",
+                    f"fallback campaign for {streamer.stream.game_name()}; "
+                    "checking the fallback campaigns instead",
                     level=logging.DEBUG,
                 )
             else:
@@ -5380,15 +5528,35 @@ class Twitch(object):
                 campaign_ids.add(str(campaign_id))
 
         if require_twitch_allowlist and not campaign_ids:
-            with self.__eligibility_lock():
-                self.category_campaign_eligibility[(game_slug, streamer.username)] = (
-                    0,
-                    0,
-                )
+            self.__record_channel_verdict(game_slug, streamer.username, (0, 0))
             self.__log_drop_check(
                 f"Twitch channel '{streamer.username}' advertises no active "
                 f"campaign for {streamer.stream.game_name()}",
                 level=logging.DEBUG,
+            )
+        elif campaign_ids and channel_query_answered and is_drop_discovered(streamer):
+            # Twitch answered and the channel qualifies through the fallback
+            # campaigns: record that, replacing any earlier negative verdict.
+            # These summaries carry no drops to check against the time left,
+            # so apply what is known: completed campaigns and the game's
+            # campaign deadline.
+            deadline = (getattr(self, "category_campaign_deadlines", None) or {}).get(
+                game_slug
+            )
+            eligible_ids = (
+                []
+                if deadline is not None and deadline <= datetime.utcnow()
+                else [
+                    campaign_id
+                    for campaign_id in campaign_ids
+                    if campaign_id
+                    not in (getattr(self, "completed_drop_campaigns", None) or set())
+                ]
+            )
+            self.__record_channel_verdict(
+                game_slug,
+                streamer.username,
+                (len(eligible_ids), len(campaign_ids)),
             )
         return list(campaign_ids)
 
@@ -6461,6 +6629,18 @@ class Twitch(object):
                 "ELIGIBLE_FOR_ALL",
                 "DROP_INSTANCE_ALREADY_CLAIMED",
             ]:
+                # The inventory snapshot still lists this drop as in progress
+                # until the next sync; stop applying it to channel checks so
+                # a just-finished campaign does not look earnable.
+                minutes_by_drop_id = (
+                    getattr(self, "drop_inventory_minutes_by_drop_id", None) or {}
+                )
+                if str(drop.id or "") in minutes_by_drop_id:
+                    self.drop_inventory_minutes_by_drop_id = {
+                        drop_id: minutes
+                        for drop_id, minutes in minutes_by_drop_id.items()
+                        if drop_id != str(drop.id or "")
+                    }
                 if campaign is not None:
                     remaining_drops = [
                         campaign_drop

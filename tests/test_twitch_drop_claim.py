@@ -1,5 +1,6 @@
 import importlib
 import logging
+import time
 from threading import Lock
 from types import SimpleNamespace
 
@@ -326,9 +327,11 @@ def test_reward_campaign_advertised_by_channel_falls_back_to_gist_drop_campaign(
     assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == [
         "real-drop-campaign-1"
     ]
-    # Left unset (not a conclusive (0, N)) so the gist-based fallback in
-    # __category_drops_condition remains free to apply.
-    assert ("example-game", "drops-channel") not in twitch.category_campaign_eligibility
+    # Recorded as eligible through the gist campaign, not a conclusive (0, N).
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        1,
+        1,
+    )
 
 
 def test_unlisted_reward_campaign_still_falls_back_to_gist_drop_campaign(monkeypatch):
@@ -374,7 +377,10 @@ def test_unlisted_reward_campaign_still_falls_back_to_gist_drop_campaign(monkeyp
     assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == [
         "real-drop-campaign-1"
     ]
-    assert ("example-game", "drops-channel") not in twitch.category_campaign_eligibility
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        1,
+        1,
+    )
 
 
 def test_campaign_names_from_ids_resolves_before_sync_campaigns_catches_up(monkeypatch):
@@ -525,9 +531,51 @@ def test_null_channel_query_keeps_explicit_twitch_allowlist(monkeypatch):
     assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == [
         "sword"
     ]
+    # Recorded from what the channel check found, not discovery's seed.
     assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
-        2,
-        2,
+        1,
+        1,
+    )
+
+
+def test_answered_channel_query_excludes_completed_fallback_campaign(monkeypatch):
+    twitch = per_streamer_campaigns_twitch(
+        monkeypatch,
+        lambda channel_id: SimpleNamespace(campaigns=[], campaigns_available=False),
+    )
+    twitch.active_drop_campaigns["example-game"].append(
+        {"id": "sword", "name": "Sword", "channels": ["drops-channel"]}
+    )
+    twitch.completed_drop_campaigns = {"sword"}
+
+    assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == [
+        "sword"
+    ]
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        0,
+        1,
+    )
+
+
+def test_answered_channel_query_excludes_fallback_after_game_deadline(monkeypatch):
+    from datetime import datetime, timedelta
+
+    twitch = per_streamer_campaigns_twitch(
+        monkeypatch,
+        lambda channel_id: SimpleNamespace(campaigns=[], campaigns_available=False),
+    )
+    twitch.active_drop_campaigns["example-game"].append(
+        {"id": "sword", "name": "Sword", "channels": ["drops-channel"]}
+    )
+    twitch.category_campaign_deadlines = {
+        "example-game": datetime.utcnow() - timedelta(minutes=1)
+    }
+
+    twitch._Twitch__get_campaign_ids_from_streamer(category_streamer())
+
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        0,
+        1,
     )
 
 
@@ -543,6 +591,173 @@ def test_null_channel_query_keeps_unrestricted_gist_campaign(monkeypatch):
     assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == [
         "gist-open"
     ]
+
+
+def test_answered_channel_query_replaces_stale_negative_verdict(monkeypatch):
+    # Category discovery keeps a fresh per-channel verdict across refreshes
+    # (#144), so the channel check must replace a negative one with a
+    # positive verdict once the channel qualifies - deleting it would leave
+    # the channel ineligible, since the game was already evaluated.
+    twitch = per_streamer_campaigns_twitch(
+        monkeypatch,
+        lambda channel_id: SimpleNamespace(campaigns=[], campaigns_available=False),
+    )
+    twitch.twitchdrops_app_campaigns["example-game"].append(
+        {"id": "gist-open", "name": "General Drops", "channels": []}
+    )
+    twitch.category_campaign_eligibility[("example-game", "drops-channel")] = (0, 0)
+    twitch.evaluated_category_campaigns = {"example-game"}
+    streamer = category_streamer()
+    streamer.is_online = True
+    streamer.settings = SimpleNamespace(claim_drops=True)
+    streamer.stream.campaigns_ids = []
+
+    assert twitch._Twitch__get_campaign_ids_from_streamer(streamer) == ["gist-open"]
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        1,
+        1,
+    )
+    assert ("example-game", "drops-channel") not in twitch.category_channel_verdicts
+    assert twitch._Twitch__category_drops_condition(streamer) is True
+
+
+def test_channel_verdicts_store_only_fresh_negative_results(monkeypatch):
+    # Only negative verdicts can outrank discovery, and expired ones (for
+    # example from games no longer discovered) are pruned on every record.
+    twitch = bare_twitch(monkeypatch)
+    twitch_module = importlib.import_module("TwitchChannelPointsMiner.classes.Twitch")
+    monkeypatch.setattr(twitch_module.time, "time", lambda: 10_000)
+    twitch.category_channel_verdicts = {
+        ("old-game", "gone"): ((0, 0), 1_000),
+        ("game", "recent"): ((0, 1), 9_900),
+    }
+    record = twitch._Twitch__record_channel_verdict
+
+    record("game", "ruled-out", (0, 2))
+    record("game", "recent", (1, 1))
+
+    assert twitch.category_channel_verdicts == {
+        ("game", "ruled-out"): ((0, 2), 10_000),
+    }
+    assert twitch.category_campaign_eligibility == {
+        ("game", "ruled-out"): (0, 2),
+        ("game", "recent"): (1, 1),
+    }
+
+
+def test_accepted_claim_stops_applying_inventory_progress(monkeypatch):
+    twitch = bare_twitch(monkeypatch)
+    twitch.drop_inventory_minutes_by_drop_id = {"drop-1": 9, "drop-2": 5}
+    monkeypatch.setattr(
+        Twitch, "_Twitch__save_drop_claim_analytics", lambda *args, **kwargs: None
+    )
+    drop = SimpleNamespace(id="drop-1", drop_instance_id="instance-1")
+
+    assert twitch.claim_drop(drop) is True
+    assert twitch.drop_inventory_minutes_by_drop_id == {"drop-2": 5}
+
+
+def test_failed_channel_query_keeps_negative_verdict(monkeypatch):
+    def available_drops(channel_id):
+        raise RetryError("DropsHighlightService_AvailableDrops", [])
+
+    twitch = per_streamer_campaigns_twitch(monkeypatch, available_drops)
+    twitch.category_campaign_eligibility[("example-game", "drops-channel")] = (0, 0)
+
+    assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer())
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        0,
+        0,
+    )
+
+
+def _late_campaign_twitch(monkeypatch, minutes_by_drop_id, snapshot_age=60):
+    # EXFIL Brothers Day 4: one advertised campaign whose next drop needs
+    # more minutes than are left, unless the account's inventory progress on
+    # that drop is counted.
+    from datetime import datetime, timedelta
+
+    ends_at = (datetime.utcnow() + timedelta(minutes=275)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    campaign = advertised_campaign()
+    campaign["endAt"] = ends_at
+    drop = campaign["timeBasedDrops"][0]
+    drop["id"] = "drop-5"
+    drop["requiredMinutesWatched"] = 300
+    drop["endAt"] = ends_at
+    twitch = bare_twitch(monkeypatch)
+    twitch.gql = SimpleNamespace(
+        get_available_drops=lambda channel_id: SimpleNamespace(
+            campaigns=[campaign], campaigns_available=True
+        )
+    )
+    twitch.drop_inventory_minutes_by_drop_id = minutes_by_drop_id
+    twitch.drop_inventory_progress_updated_at = time.time() - snapshot_age
+    twitch.awarded_game_event_drops = {}
+    monkeypatch.setattr(
+        Twitch, "_Twitch__get_campaigns_details", lambda self, *a, **k: []
+    )
+    return twitch
+
+
+def test_channel_check_counts_inventory_progress_toward_late_drop(monkeypatch):
+    # Regression: the channel query carries no per-account progress, so a
+    # drop needing 300m with 275m left looked impossible even though the
+    # account had already watched 240m of it, and the campaign was dropped.
+    twitch = _late_campaign_twitch(monkeypatch, {"drop-5": 240})
+
+    assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == [
+        "campaign-1"
+    ]
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        1,
+        1,
+    )
+
+
+def test_channel_check_without_progress_rules_out_late_drop(monkeypatch):
+    twitch = _late_campaign_twitch(monkeypatch, {})
+
+    assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == []
+
+
+def test_channel_check_ignores_outdated_inventory_progress(monkeypatch):
+    # An old snapshot can still list a drop claimed since, so it is not used.
+    twitch = _late_campaign_twitch(monkeypatch, {"drop-5": 240}, snapshot_age=901)
+
+    assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == []
+
+
+def test_inventory_cache_indexes_in_progress_minutes_by_drop_id(monkeypatch):
+    twitch = bare_twitch(monkeypatch)
+    twitch._Twitch__cache_drop_inventory_progress(
+        {
+            "dropCampaignsInProgress": [
+                {
+                    "id": "campaign-1",
+                    "name": "Example Campaign",
+                    "game": {"displayName": "Example Game"},
+                    "timeBasedDrops": [
+                        {
+                            "id": "drop-5",
+                            "name": "Drop 5",
+                            "requiredMinutesWatched": 300,
+                            "self": {"currentMinutesWatched": 240},
+                        },
+                        {
+                            "id": "drop-4",
+                            "name": "Drop 4",
+                            "requiredMinutesWatched": 240,
+                            "self": {"currentMinutesWatched": 240, "isClaimed": True},
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert twitch.drop_inventory_minutes_by_drop_id == {"drop-5": 240}
 
 
 def test_failed_channel_query_keeps_unrestricted_twitch_campaigns(monkeypatch):
