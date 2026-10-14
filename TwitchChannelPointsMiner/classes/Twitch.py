@@ -3664,6 +3664,21 @@ class Twitch(object):
             if username:
                 usernames.append(username)
 
+        drop_pick = getattr(self, "last_drop_pick_streamer", None)
+        if (
+            drops_enabled is True
+            and drop_pick in (drops_enabled_logins or set())
+            and self.__is_live_in_game(
+                drop_pick,
+                game_id,
+                {
+                    (stream.get("user_login") or "").lower().strip()
+                    for stream in stream_candidates
+                },
+            )
+        ):
+            usernames = self.__keep_drop_pick(usernames, drop_pick, max_results)
+
         game_slug = self.__slugify(game_name)
         total_campaigns = len(fallback_campaigns) or 1
         self.__replace_category_campaign_eligibility(
@@ -3696,6 +3711,36 @@ class Twitch(object):
             extra={"emoji": ":satellite_antenna:"},
         )
         return usernames
+
+    def __live_stream_for(self, login):
+        response = self.__helix_get("streams", {"user_login": login, "first": 1})
+        stream = (response.get("data") or [None])[0]
+        return stream if isinstance(stream, dict) else None
+
+    def __is_live_in_game(self, login, game_id, live_logins):
+        """Whether a channel is live in game_id. live_logins are the channels
+        discovery already found live in the game; any other channel is looked
+        up separately."""
+        if login in live_logins:
+            return True
+        stream = self.__live_stream_for(login)
+        return stream is not None and str(stream.get("game_id") or "") == str(game_id)
+
+    @staticmethod
+    def __keep_drop_pick(usernames, drop_pick, limit):
+        """Keep the current Drops pick among discovery's results.
+
+        Discovery's top results rotate between refreshes in categories with
+        many small channels, so a pick missing from them was retired and
+        replaced at nearly every refresh. Keeping it in the results, in place
+        of the last one so the limit still holds, lets it go through the same
+        eligibility checks as every other discovered channel.
+        """
+        if drop_pick is None or drop_pick in usernames:
+            return usernames
+        if limit is not None:
+            usernames = usernames[: max(limit - 1, 0)]
+        return usernames + [drop_pick]
 
     def __get_live_restricted_campaign_streamers(
         self,
@@ -3746,6 +3791,15 @@ class Twitch(object):
             ) or (max_total is not None and len(live_streams) >= max_total):
                 break
 
+        drop_pick = getattr(self, "last_drop_pick_streamer", None)
+        if drop_pick in overlap_counts and drop_pick not in live_streams:
+            pick_stream = self.__live_stream_for(drop_pick)
+            if pick_stream is not None and (
+                allow_cross_category
+                or str(pick_stream.get("game_id") or "") == str(game_id)
+            ):
+                live_streams[drop_pick] = pick_stream
+
         sorted_live_streams = sorted(
             live_streams.values(),
             key=lambda stream: stream.get("viewer_count", 0),
@@ -3776,6 +3830,8 @@ class Twitch(object):
         usernames.sort(key=lambda login: -eligible_campaign_counts.get(login, 0))
         if max_total is not None:
             usernames = usernames[:max_total]
+        if drop_pick in live_streams:
+            usernames = self.__keep_drop_pick(usernames, drop_pick, max_total)
         game_slug = self.__slugify(game_name)
         self.__replace_category_campaign_eligibility(
             game_slug,
