@@ -1,5 +1,8 @@
 import io
 import logging
+import queue
+import threading
+import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +13,10 @@ from TwitchChannelPointsMiner.classes.Settings import Events
 from TwitchChannelPointsMiner.logger import (
     GlobalFormatter,
     LoggerSettings,
+    LoggingQueueListener,
+    SKIP_NOTIFICATIONS,
     NotificationHandler,
+    NotificationQueueHandler,
     configure_loggers,
 )
 
@@ -146,7 +152,10 @@ def test_failing_provider_does_not_block_the_others(caplog):
     handler.handle(_record(event=Events.STREAMER_ONLINE))
 
     discord.send.assert_called_once_with("Streamer is online", Events.STREAMER_ONLINE)
-    assert "Unable to send telegram notification: RuntimeError" in caplog.text
+    assert (
+        "Notifications to telegram are failing: The notifier raised RuntimeError."
+        in caplog.text
+    )
     assert "SECRET-TOKEN" not in caplog.text
 
 
@@ -181,8 +190,8 @@ def test_delivery_failure_reason_is_logged(caplog):
         handler.handle(_record(event=Events.STREAMER_ONLINE))
 
     assert (
-        "Notification not sent: Telegram rejected the configured credentials "
-        "(HTTP 401)." in caplog.text
+        "Notifications to telegram are failing: Telegram rejected the configured "
+        "credentials (HTTP 401)." in caplog.text
     )
 
 
@@ -208,3 +217,193 @@ def test_successful_delivery_logs_nothing(caplog):
 
     telegram.send.assert_called_once()
     assert caplog.text == ""
+
+
+def test_notification_only_records_skip_console_and_log_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    telegram = _telegram(events=(Events.DROP_STATUS,))
+    settings = LoggerSettings(file_level=logging.DEBUG, telegram=telegram)
+
+    with _configured(settings) as listener:
+        stream = io.StringIO()
+        _console_handler(listener).setStream(stream)
+        logger = logging.getLogger("miner")
+        logger.info(
+            "Drop: 50%", extra={"event": Events.DROP_STATUS, **SKIP_NOTIFICATIONS}
+        )
+        logger.info(
+            "streamer is streaming\nDrop: 50%",
+            extra={"event": Events.DROP_STATUS, "notification_only": True},
+        )
+
+    telegram.send.assert_called_once_with(
+        "streamer is streaming\nDrop: 50%", Events.DROP_STATUS
+    )
+    log_file = (tmp_path / "logs" / "test-user.log").read_text(encoding="utf-8")
+    for output in (stream.getvalue(), log_file):
+        assert "Drop: 50%" in output
+        assert "streamer is streaming" not in output
+
+
+def test_skip_notifications_silences_every_provider():
+    assert set(SKIP_NOTIFICATIONS) == {
+        f"skip_{provider}" for provider in NotificationHandler.PLACEHOLDERS
+    }
+    notifiers = {}
+    for provider in NotificationHandler.PLACEHOLDERS:
+        notifier = MagicMock()
+        notifier.events = [str(Events.DROP_STATUS)]
+        notifiers[provider] = notifier
+    settings = LoggerSettings(username="", **notifiers)
+    handler = NotificationHandler(settings)
+
+    handler.handle(
+        _record("Watching for points", event=Events.DROP_STATUS, **SKIP_NOTIFICATIONS)
+    )
+
+    for notifier in notifiers.values():
+        notifier.send.assert_not_called()
+
+
+def test_slow_notifier_does_not_delay_console_output():
+    release = threading.Event()
+    telegram = _telegram()
+    telegram.send.side_effect = lambda *_args: release.wait(5) and (True, None)
+    settings = LoggerSettings(save=False, telegram=telegram)
+
+    with _configured(settings) as listener:
+        stream = io.StringIO()
+        _console_handler(listener).setStream(stream)
+        logger = logging.getLogger("miner")
+        logger.info("Streamer is online", extra={"event": Events.STREAMER_ONLINE})
+        logger.info("next line")
+
+        deadline = time.monotonic() + 2
+        while "next line" not in stream.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        console_before_release = stream.getvalue()
+        release.set()
+
+    assert "next line" in console_before_release
+    # Stopping the listener still delivers the queued notification.
+    telegram.send.assert_called_once_with("Streamer is online", Events.STREAMER_ONLINE)
+
+
+def test_failure_while_draining_at_shutdown_is_still_logged():
+    def slow_failure(*_args):
+        # Fail after stop() has already stopped the log listener.
+        time.sleep(0.2)
+        return False, "Telegram rejected the configured credentials (HTTP 401)."
+
+    telegram = _telegram()
+    telegram.send.side_effect = slow_failure
+    settings = LoggerSettings(save=False, telegram=telegram)
+
+    with _configured(settings) as listener:
+        stream = io.StringIO()
+        _console_handler(listener).setStream(stream)
+        logging.getLogger("miner").info(
+            "Final report", extra={"event": Events.STREAMER_ONLINE}
+        )
+
+    assert "Notifications to telegram are failing" in stream.getvalue()
+
+
+def test_an_outage_is_logged_once_until_delivery_recovers(caplog):
+    first = "Discord reported a server error (HTTP 502)."
+    second = "Discord reported a server error (HTTP 503)."
+    telegram = _telegram()
+    telegram.send.side_effect = [
+        (False, first),
+        (False, second),
+        RuntimeError("boom"),
+        (True, None),
+        (False, first),
+    ]
+    handler = NotificationHandler(LoggerSettings(telegram=telegram, username=""))
+
+    with caplog.at_level(logging.DEBUG, logger="TwitchChannelPointsMiner.logger"):
+        for _ in range(5):
+            handler.handle(_record(event=Events.STREAMER_ONLINE))
+
+    suffix = " Further failures are not logged until one gets through."
+    assert [(r.levelname, r.getMessage()) for r in caplog.records] == [
+        ("WARNING", f"Notifications to telegram are failing: {first}{suffix}"),
+        ("DEBUG", f"Notifications to telegram are still failing: {second}"),
+        (
+            "DEBUG",
+            "Notifications to telegram are still failing: "
+            "The notifier raised RuntimeError.",
+        ),
+        ("INFO", "Notifications to telegram are being delivered again"),
+        ("WARNING", f"Notifications to telegram are failing: {first}{suffix}"),
+    ]
+
+
+def test_message_build_failure_is_worded_clearly(caplog, monkeypatch):
+    telegram = _telegram()
+    handler = NotificationHandler(LoggerSettings(telegram=telegram, username=""))
+    monkeypatch.setattr(
+        "TwitchChannelPointsMiner.logger.decorate_message",
+        MagicMock(side_effect=TypeError("bad")),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        handler.handle(_record(event=Events.STREAMER_ONLINE))
+
+    assert caplog.messages == ["Unable to build the notification message: TypeError"]
+    telegram.send.assert_not_called()
+
+
+def test_notification_thread_gets_its_own_copy_of_the_record():
+    notification_queue = queue.Queue()
+    record = _record(event=Events.STREAMER_ONLINE)
+
+    NotificationQueueHandler(notification_queue).handle(record)
+    queued = notification_queue.get_nowait()
+
+    assert queued is not record
+    assert queued.event == Events.STREAMER_ONLINE
+    assert queued.getMessage() == "Streamer is online"
+
+
+def test_shutdown_stops_waiting_for_a_stuck_notifier(monkeypatch):
+    monkeypatch.setattr(LoggingQueueListener, "NOTIFICATION_SHUTDOWN_TIMEOUT", 0.2)
+    release = threading.Event()
+    telegram = _telegram()
+    telegram.send.side_effect = lambda *_args: release.wait(5) and (True, None)
+    settings = LoggerSettings(save=False, telegram=telegram)
+
+    try:
+        with _configured(settings) as listener:
+            stream = io.StringIO()
+            _console_handler(listener).setStream(stream)
+            logging.getLogger("miner").info(
+                "Streamer is online", extra={"event": Events.STREAMER_ONLINE}
+            )
+            started = time.monotonic()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 2
+    assert "Stopped waiting for notifications after 0.2 seconds" in stream.getvalue()
+
+
+def test_stop_can_be_called_twice():
+    settings = LoggerSettings(save=False, telegram=_telegram())
+
+    with _configured(settings) as listener:
+        listener.stop()
+
+
+def test_no_notification_thread_without_a_provider():
+    with _configured(LoggerSettings(save=False)) as listener:
+        assert listener.notification_listener is None
+        assert not any(
+            isinstance(handler, NotificationQueueHandler)
+            for handler in listener.handlers
+        )
+
+    with _configured(LoggerSettings(save=False, telegram=_telegram())) as listener:
+        assert listener.notification_listener is not None
