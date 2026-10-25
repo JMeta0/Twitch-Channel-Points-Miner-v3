@@ -862,11 +862,21 @@ class TwitchChannelPointsMiner:
                 )
 
                 if categories and eligible_categories == []:
-                    logger.log(
-                        category_log_level,
-                        "Skipping category stream discovery: no configured categories have active incomplete campaigns",
-                        extra={"emoji": ":sleeping:", "category_log": True},
-                    )
+                    # Keep the two causes apart in the log: a failed inventory
+                    # load is a transient outage, not evidence that no campaign
+                    # is running (same distinction the refresh makes).
+                    if not Twitch.drops_inventory_loaded(discovery_inventory):
+                        logger.log(
+                            category_log_level,
+                            "Skipping category stream discovery: drops inventory unavailable",
+                            extra={"emoji": ":pause_button:", "category_log": True},
+                        )
+                    else:
+                        logger.log(
+                            category_log_level,
+                            "Skipping category stream discovery: no configured categories have active incomplete campaigns",
+                            extra={"emoji": ":sleeping:", "category_log": True},
+                        )
 
                 for category in eligible_categories:
                     all_category_usernames.extend(
@@ -1940,6 +1950,14 @@ class TwitchChannelPointsMiner:
         discovery_inventory = None
         if drops_enabled and (categories or wildcard_categories):
             discovery_inventory = self.twitch.get_drops_inventory()
+        # A failed inventory load comes back empty, and both discovery passes
+        # then skip and return no categories. That means "not evaluated this
+        # cycle", not "gone", so the reconcile calls below must not treat the
+        # empty discovery lists as evidence that tracked streamers are stale.
+        inventory_unavailable = (
+            discovery_inventory is not None
+            and not Twitch.drops_inventory_loaded(discovery_inventory)
+        )
         eligible_categories = self.twitch.filter_categories_with_active_drops(
             categories,
             order=campaign_order,
@@ -1982,8 +2000,15 @@ class TwitchChannelPointsMiner:
         # and finds them actually gone -- or immediately, below, if
         # wildcard_categories itself has been turned off (that reconcile
         # still runs unconditionally, same "off means off" semantics as
-        # disabling `categories`).
-        wildcard_discovery_ran = wildcard_categories and not discovered_usernames
+        # disabling `categories`). Wildcard discovery also stands down when
+        # the drops inventory failed to load: it can't evaluate campaigns
+        # without it, so its empty result would wrongly retire every tracked
+        # wildcard streamer.
+        wildcard_discovery_ran = (
+            wildcard_categories
+            and not discovered_usernames
+            and not inventory_unavailable
+        )
         wildcard_standing_down = wildcard_categories and not wildcard_discovery_ran
         wildcard_discovered_usernames = []
         if wildcard_discovery_ran:
@@ -2021,8 +2046,11 @@ class TwitchChannelPointsMiner:
 
         # Keep the previous category set available while replacement channels
         # are initialized so the minute watcher cannot observe a partial refresh.
-        self.__reconcile_category_streamers(discovered_usernames, wildcard=False)
-        self.__order_category_streamers(discovered_usernames, wildcard=False)
+        # Disabled `categories` still reconciles against the empty list, so
+        # turning the setting off retires its streamers even mid-outage.
+        if not (categories and inventory_unavailable):
+            self.__reconcile_category_streamers(discovered_usernames, wildcard=False)
+            self.__order_category_streamers(discovered_usernames, wildcard=False)
         if not wildcard_standing_down:
             self.__reconcile_category_streamers(
                 wildcard_discovered_usernames, wildcard=True
@@ -2038,6 +2066,17 @@ class TwitchChannelPointsMiner:
             )
             self.sync_campaigns_thread.name = "Sync campaigns/inventory"
             self.sync_campaigns_thread.start()
+
+        if inventory_unavailable:
+            # Replaces the summary below, which would read "0 active
+            # categories" as if discovery had succeeded with nothing to find.
+            logger.log(
+                category_log_level,
+                "Category discovery skipped: drops inventory unavailable; "
+                "streamers from enabled category settings are kept until the next refresh",
+                extra={"emoji": ":pause_button:", "category_log": True},
+            )
+            return
 
         unique_wildcard_discovered = len(dict.fromkeys(wildcard_discovered_usernames))
         logger.log(
