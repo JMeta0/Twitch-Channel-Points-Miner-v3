@@ -1,0 +1,136 @@
+"""Optional History dashboard tab.
+
+The feature is intentionally self-contained: the miner calls
+``start_history(username)`` once when analytics starts, and the analytics
+server registers the blueprint in ``web.py``.  Both entry points are safe
+no-ops when the recorder cannot start, so the rest of the miner is never
+affected by a history problem.
+"""
+
+import atexit
+import logging
+import os
+import threading
+
+logger = logging.getLogger(__name__)
+
+_lock = threading.Lock()
+_recorder = None
+_store = None
+_atexit_registered = False
+DEFAULT_RETENTION_DAYS = 730
+
+
+def _history_retention_days():
+    raw = os.environ.get("TCPM_HISTORY_RETENTION_DAYS")
+    if raw in (None, ""):
+        return DEFAULT_RETENTION_DAYS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid TCPM_HISTORY_RETENTION_DAYS=%r; using %s days",
+            raw,
+            DEFAULT_RETENTION_DAYS,
+        )
+        return DEFAULT_RETENTION_DAYS
+    return max(0, value)
+
+
+def _miner_version():
+    try:
+        from TwitchChannelPointsMiner import __version__
+
+        return __version__
+    except Exception:
+        return None
+
+
+def _resolve_paths(username):
+    from TwitchChannelPointsMiner.classes.Settings import Settings
+
+    analytics_path = getattr(Settings, "analytics_path", None)
+    if not analytics_path:
+        analytics_path = os.path.join(
+            os.path.abspath(os.getcwd()), "analytics", str(username)
+        )
+    cache_path = os.path.join(
+        os.path.abspath(os.getcwd()),
+        "logs",
+        ".state",
+        f"watch_streak_cache.{str(username).lower()}.json",
+    )
+    return analytics_path, cache_path
+
+
+def start_history(username):
+    """Start the passive recorder once for this process.
+
+    Returns the recorder, or ``None`` when history is unavailable.  Callers
+    must treat failure as non-fatal.
+    """
+
+    global _recorder, _store, _atexit_registered
+
+    with _lock:
+        if _recorder is not None and _recorder.is_alive():
+            return _recorder
+        try:
+            from TwitchChannelPointsMiner.history.recorder import build_recorder
+
+            analytics_path, cache_path = _resolve_paths(username)
+            recorder = build_recorder(
+                analytics_path,
+                cache_path,
+                username,
+                version=_miner_version(),
+                retention_days=_history_retention_days(),
+            )
+            _store = recorder.store
+            recorder.start()
+            _recorder = recorder
+            if not _atexit_registered:
+                atexit.register(stop_history)
+                _atexit_registered = True
+            logger.info(
+                "History recorder started for account '%s' (database: %s)",
+                username,
+                recorder.store.path,
+            )
+            return recorder
+        except Exception:
+            logger.exception("Unable to start the optional History dashboard recorder")
+            _recorder = None
+            _store = None
+            return None
+
+
+def stop_history():
+    global _recorder, _store
+
+    with _lock:
+        recorder = _recorder
+        _recorder = None
+        _store = None
+    if recorder is None:
+        return
+    recorder.stop()
+    if recorder is not threading.current_thread():
+        recorder.join(timeout=10)
+
+
+def get_store():
+    """Return the initialized store, or None while history is unavailable."""
+
+    store = _store
+    if store is None or not store.ready:
+        return None
+    return store
+
+
+__all__ = [
+    "DEFAULT_RETENTION_DAYS",
+    "get_store",
+    "start_history",
+    "stop_history",
+]

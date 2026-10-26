@@ -485,9 +485,17 @@ def read_dashboard_prefs():
 
 def index(refresh=5, days_ago=7, log_poll_interval=5):
     assets_folder = get_assets_folder()
+    asset_files = (
+        "script.js",
+        "style.css",
+        "dark-theme.css",
+        "history.js",
+        "history.css",
+    )
     asset_version = max(
         os.path.getmtime(os.path.join(assets_folder, filename))
-        for filename in ("script.js", "style.css", "dark-theme.css")
+        for filename in asset_files
+        if os.path.isfile(os.path.join(assets_folder, filename))
     )
     latest_version = getattr(Settings, "latest_release_version", None)
     dismissed_version = request.cookies.get(UPDATE_DISMISSAL_COOKIE)
@@ -615,6 +623,18 @@ def delete_streamer_analytics(streamer):
 
     logger.info(f"Deleted analytics data in '{filename}'")
     response_cache.clear()
+
+    # The optional History tab keeps its own durable copy of point, watch and
+    # live-session data, so "delete analytics data" must clear that too.
+    try:
+        from TwitchChannelPointsMiner.history import get_store
+
+        store = get_store()
+        if store is not None:
+            store.delete_streamer(filename[: -len(".json")])
+    except Exception:
+        logger.exception("Unable to delete optional streamer history")
+
     return Response(status=204)
 
 
@@ -826,6 +846,13 @@ class AnalyticsServer(Thread):
             template_folder=get_assets_folder(),
             static_folder=get_assets_folder(),
         )
+
+        try:
+            from TwitchChannelPointsMiner.history.web import register_history
+
+            register_history(self.app)
+        except Exception:
+            logger.exception("Unable to register the optional History dashboard")
 
         @self.app.before_request
         def require_authentication():

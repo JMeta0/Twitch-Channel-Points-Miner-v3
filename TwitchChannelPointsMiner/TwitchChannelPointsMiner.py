@@ -614,6 +614,9 @@ class TwitchChannelPointsMiner:
     ):
         # Analytics switch
         if Settings.enable_analytics is True:
+            from TwitchChannelPointsMiner.history import start_history
+
+            start_history(self.username)
             from TwitchChannelPointsMiner.classes.AnalyticsServer import AnalyticsServer
 
             days_ago = days_ago if days_ago <= 365 * 15 else 365 * 15
