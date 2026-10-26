@@ -686,6 +686,39 @@ class HistoryStore(object):
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def watched_streamers(self):
+        """Return every streamer the miner has actually watched."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT streamer FROM watch_sessions"
+            ).fetchall()
+        return {row["streamer"] for row in rows}
+
+    def prune_untracked_streams(self):
+        """Drop live-session data for streamers that were never watched.
+
+        Older history builds recorded live sessions for every monitored
+        category/badge channel.  Keep point/watch/streak history intact, but
+        remove live-only rows that would otherwise clutter the dashboard.
+        """
+
+        with self._write_connection() as connection:
+            connection.execute("""
+                DELETE FROM streams
+                WHERE streamer NOT IN (SELECT streamer FROM watch_sessions)
+                """)
+            connection.execute("""
+                UPDATE daily_stats SET stream_sessions = 0
+                WHERE streamer NOT IN (SELECT streamer FROM watch_sessions)
+                """)
+            connection.execute("""
+                DELETE FROM daily_stats
+                WHERE streamer NOT IN (SELECT streamer FROM watch_sessions)
+                  AND points_gained = 0 AND points_spent = 0
+                  AND watch_seconds = 0 AND streak_count = 0
+                """)
+
     def set_import_state(
         self, source, mtime=None, size=None, last_x=None, last_balance=None
     ):

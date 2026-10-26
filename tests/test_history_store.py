@@ -118,7 +118,23 @@ def test_streamer_detail_and_activity(store):
     assert cell["live_seconds"] == 3600
 
 
-def test_import_state_and_retention(store):
+def test_prune_untracked_streams_removes_live_only_rows(store):
+    store.start_watch_session("alice", "points", NOW)
+    store.upsert_stream_session("alice", "a1", NOW, ended_at=NOW + 10)
+    store.upsert_stream_session("bob", "b1", NOW, ended_at=NOW + 10)
+
+    store.prune_untracked_streams()
+
+    streams = store.sessions(kind="stream", days=1, now=NOW + 20)
+    assert streams["total"] == 1
+    assert streams["sessions"][0]["streamer"] == "alice"
+
+    streamers = store.streamers(days=1, now=NOW + 20)
+    assert [item["streamer"] for item in streamers] == ["alice"]
+    assert streamers[0]["stream_sessions"] == 1
+
+
+def test_daily_stats_and_retention(store):
     store.set_import_state("source", mtime=1.0, size=2, last_x=3.0, last_balance=4)
     state = store.get_import_state("source")
     assert state["last_x"] == 3.0
