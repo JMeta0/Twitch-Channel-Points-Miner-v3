@@ -94,6 +94,11 @@
         return checkbox && checkbox.checked === false ? '#373d3f' : '#f5f5f5';
     }
 
+    function chartTooltipTheme() {
+        var checkbox = byId('dark-mode');
+        return checkbox && checkbox.checked === false ? 'light' : 'dark';
+    }
+
     function applyHistoryTheme() {
         var panel = byId('history-panel');
         if (!panel) return;
@@ -498,6 +503,7 @@
                 xaxis: { categories: categories, labels: { rotate: -45 } },
                 legend: { position: 'top' },
                 tooltip: {
+                    theme: chartTooltipTheme(),
                     y: { formatter: function (value) { return formatNumber(value); } }
                 },
                 noData: { text: 'No points recorded in this window.' }
@@ -523,6 +529,7 @@
                 xaxis: { categories: categories, labels: { rotate: -45 } },
                 yaxis: { labels: { formatter: function (value) { return value + 'h'; } } },
                 tooltip: {
+                    theme: chartTooltipTheme(),
                     y: { formatter: function (value) { return formatDuration(value * 3600); } }
                 },
                 noData: { text: 'No watch time recorded in this window.' }
