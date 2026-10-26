@@ -170,6 +170,39 @@ def test_recorder_tracks_watch_sessions_from_now_watching(recorder):
     assert sessions["sessions"][0]["ended_at"] == NOW + 50
 
 
+def test_recorder_ignores_live_sessions_until_streamer_is_watched(recorder):
+    clock = recorder.clock
+    clock.value = NOW + 30
+    payload = {
+        "version": 1,
+        "sessions": [
+            {
+                "account_name": "alice",
+                "streamer_login": "bob",
+                "broadcast_id": "b1",
+                "started_at": NOW,
+                "claimed": False,
+                "claimed_at": None,
+                "ended_at": None,
+            }
+        ],
+    }
+    _write_json(recorder.streak_cache_path, payload, clock.value)
+    recorder._ingest_streak_cache()
+
+    assert recorder.store.sessions(kind="stream", days=1, now=clock.value)["total"] == 0
+
+    path = os.path.join(recorder.analytics_path, "now_watching.json")
+    clock.value = NOW + 40
+    _write_json(path, [{"username": "bob", "reason": "drops"}], clock.value)
+    recorder._poll_now_watching()
+
+    streams = recorder.store.sessions(kind="stream", days=1, now=clock.value)
+    assert streams["total"] == 1
+    assert streams["sessions"][0]["streamer"] == "bob"
+    assert streams["sessions"][0]["active"] is True
+
+
 def test_recorder_imports_streak_cache_sessions(recorder):
     clock = recorder.clock
     clock.value = NOW + 130

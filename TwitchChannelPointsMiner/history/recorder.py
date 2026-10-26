@@ -119,6 +119,9 @@ class HistoryRecorder(threading.Thread):
         self._run_id = None
         self._next_retention_at = 0.0
         self._streak_cache_key = None
+        self._watched_streamers = set()
+        self._cached_stream_sessions = []
+        self._cache_startup_closed = set()
 
     # -- lifecycle ---------------------------------------------------------
     def stop(self):
@@ -144,6 +147,8 @@ class HistoryRecorder(threading.Thread):
         self.store.close_open_watch_sessions(now)
         self.store.close_open_streams(now)
         self.store.close_open_runs()
+        self._watched_streamers = self.store.watched_streamers()
+        self.store.prune_untracked_streams()
         self._run_id = self.store.start_run(self.version, started_at=now)
         self._next_retention_at = now
         # The cache may carry an open session from an old crash.  Import those
@@ -232,6 +237,8 @@ class HistoryRecorder(threading.Thread):
             else:
                 if active is not None:
                     self._close_watch(streamer, now)
+                self._watched_streamers.add(streamer)
+                self._import_cached_sessions(streamer, now)
                 session_id = self.store.start_watch_session(
                     streamer,
                     reason,
@@ -298,6 +305,7 @@ class HistoryRecorder(threading.Thread):
         if not isinstance(sessions, list):
             return
 
+        parsed = []
         for item in sessions:
             if not isinstance(item, dict):
                 continue
@@ -316,37 +324,75 @@ class HistoryRecorder(threading.Thread):
                 ended_at = None
             if not streamer or not broadcast_id:
                 continue
-            if close_open and ended_at is None:
-                ended_at = started_at
-
-            self.store.upsert_stream_session(
-                streamer,
-                broadcast_id,
-                started_at=started_at,
-                ended_at=ended_at,
-                last_seen_at=now if ended_at is None else ended_at,
-                source="streak_cache",
+            parsed.append(
+                {
+                    "streamer": streamer,
+                    "broadcast_id": broadcast_id,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "claimed": bool(item.get("claimed", False)),
+                    "claimed_at": item.get("claimed_at"),
+                }
             )
 
-            claimed = bool(item.get("claimed", False))
-            claimed_at = item.get("claimed_at")
-            if claimed and claimed_at is not None:
-                try:
-                    claimed_at = float(claimed_at)
-                except (TypeError, ValueError):
-                    continue
-                self.store.record_event(
-                    streamer,
-                    claimed_at,
-                    "watch_streak",
-                    label="Watch streak claimed",
-                    metadata={
-                        "broadcast_id": broadcast_id,
-                        "started_at": started_at,
-                    },
-                    dedupe_key=f"streak:{streamer}:{broadcast_id}",
-                    dedupe_window=120.0,
-                )
+            if parsed[-1]["claimed"]:
+                # A streak claim proves the streamer was watched, even if this
+                # history database predates the watch-session tables.
+                self._watched_streamers.add(streamer)
+
+        self._cached_stream_sessions = parsed
+        for item in parsed:
+            if item["streamer"] not in self._watched_streamers:
+                continue
+            self._store_cached_session(item, now, close_open=close_open)
+            self._record_cached_streak(item)
+
+    def _store_cached_session(self, item, now, close_open=False):
+        started_at = item["started_at"]
+        ended_at = item["ended_at"]
+        key = (item["streamer"], item["broadcast_id"])
+        if close_open and ended_at is None:
+            ended_at = started_at
+            self._cache_startup_closed.add(key)
+        elif ended_at is None and key in self._cache_startup_closed:
+            ended_at = started_at
+
+        self.store.upsert_stream_session(
+            item["streamer"],
+            item["broadcast_id"],
+            started_at=started_at,
+            ended_at=ended_at,
+            last_seen_at=now if ended_at is None else ended_at,
+            source="streak_cache",
+        )
+
+    def _record_cached_streak(self, item):
+        if not item.get("claimed") or item.get("claimed_at") is None:
+            return
+        try:
+            claimed_at = float(item["claimed_at"])
+        except (TypeError, ValueError):
+            return
+        self.store.record_event(
+            item["streamer"],
+            claimed_at,
+            "watch_streak",
+            label="Watch streak claimed",
+            metadata={
+                "broadcast_id": item["broadcast_id"],
+                "started_at": item["started_at"],
+            },
+            dedupe_key=f"streak:{item['streamer']}:{item['broadcast_id']}",
+            dedupe_window=120.0,
+        )
+
+    def _import_cached_sessions(self, streamer, now):
+        """Backfill live sessions once a streamer is first watched."""
+
+        for item in self._cached_stream_sessions:
+            if item["streamer"] == streamer:
+                self._store_cached_session(item, now, close_open=False)
+                self._record_cached_streak(item)
 
     # -- per-streamer analytics JSON --------------------------------------
     def _analytics_files(self):
