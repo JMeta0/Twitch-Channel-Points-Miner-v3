@@ -21,7 +21,8 @@
         loading: false,
         loadedAt: 0,
         timer: null,
-        charts: {}
+        charts: {},
+        lastDaily: null
     };
 
     function byId(id) {
@@ -91,6 +92,19 @@
     function chartForeColor() {
         var checkbox = byId('dark-mode');
         return checkbox && checkbox.checked === false ? '#373d3f' : '#f5f5f5';
+    }
+
+    function applyHistoryTheme() {
+        var panel = byId('history-panel');
+        if (!panel) return;
+        var checkbox = byId('dark-mode');
+        var dark = !checkbox || checkbox.checked !== false;
+        panel.classList.toggle('history-dark', dark);
+        // ApexCharts captures foreColor at construction, so redraw the two
+        // charts when the dashboard theme changes while History is visible.
+        if (state.visible && state.lastDaily) {
+            renderCharts(state.lastDaily);
+        }
     }
 
     function buildUrl(path, params) {
@@ -279,6 +293,10 @@
                 refreshHistory();
             });
         }
+        var darkMode = byId('dark-mode');
+        if (darkMode) {
+            darkMode.addEventListener('change', applyHistoryTheme);
+        }
         var streamers = byId('history-streamers');
         if (streamers) {
             streamers.addEventListener('click', function (event) {
@@ -352,6 +370,7 @@
             renderCards(results[0]);
             renderStreamerOptions(results[1]);
             renderStreamers(results[1]);
+            state.lastDaily = results[2];
             renderCharts(results[2]);
             renderSessions(results[3]);
             renderEvents(results[4]);
@@ -752,19 +771,19 @@
             '<div class="history-detail-grid">',
             '  <div><h4 class="title is-6">Recent watch sessions</h4>' +
                 (sessionRows
-                    ? '<table class="table is-fullwidth is-narrow history-table"><thead><tr><th>Reason</th><th>Started</th><th class="num">Watched</th><th>Ended</th></tr></thead><tbody>' +
-                        sessionRows + '</tbody></table>'
+                    ? '<div class="history-table-wrap history-detail-table"><table class="table is-fullwidth is-narrow history-table"><thead><tr><th>Reason</th><th>Started</th><th class="num">Watched</th><th>Ended</th></tr></thead><tbody>' +
+                        sessionRows + '</tbody></table></div>'
                     : '<p class="history-empty">No watch sessions.</p>') + '</div>',
             '  <div><h4 class="title is-6">Recent live sessions</h4>' +
                 (streamRows
-                    ? '<table class="table is-fullwidth is-narrow history-table"><thead><tr><th>Started</th><th class="num">Duration</th><th>Status</th><th>Stream</th></tr></thead><tbody>' +
-                        streamRows + '</tbody></table>'
+                    ? '<div class="history-table-wrap history-detail-table"><table class="table is-fullwidth is-narrow history-table"><thead><tr><th>Started</th><th class="num">Duration</th><th>Status</th><th>Stream</th></tr></thead><tbody>' +
+                        streamRows + '</tbody></table></div>'
                     : '<p class="history-empty">No live sessions.</p>') + '</div>',
             '</div>',
             '<h4 class="title is-6">Streak history</h4>',
             streakRows
-                ? '<table class="table is-fullwidth is-narrow history-table"><tbody>' +
-                    streakRows + '</tbody></table>'
+                ? '<div class="history-table-wrap history-detail-table"><table class="table is-fullwidth is-narrow history-table"><tbody>' +
+                    streakRows + '</tbody></table></div>'
                 : '<p class="history-empty">No streak events yet.</p>'
         ].join('\n');
     }
@@ -784,6 +803,7 @@
         window.jQuery(document).ready(function () {
             bindControls();
             renderWindows();
+            applyHistoryTheme();
             try {
                 if (window.location.hash === '#history') {
                     switchDashboardTab('history');
