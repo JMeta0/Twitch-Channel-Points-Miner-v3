@@ -498,6 +498,39 @@ class HistoryStore(object):
                 (float(timestamp),),
             )
 
+    def resume_stream_session(self, streamer, broadcast_id, timestamp):
+        """Reopen a broadcast that is live again after a miner restart.
+
+        Startup cleanup closes broadcasts still open in the watch-streak cache
+        so a crashed run cannot leave phantom live rows.  Watching that
+        broadcast again proves it is live, so the close is reversed for the
+        newest broadcast recorded for the streamer.
+        """
+
+        streamer = _clean_streamer(streamer)
+        broadcast_id = str(broadcast_id or "").strip()
+        if not streamer or not broadcast_id:
+            return False
+        timestamp = float(timestamp)
+        with self._write_connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE streams SET
+                    ended_at = NULL,
+                    last_seen_at = MAX(last_seen_at, ?)
+                WHERE streamer = ? AND broadcast_id = ?
+                  AND ended_at IS NOT NULL
+                  AND broadcast_id = (
+                      SELECT latest.broadcast_id FROM streams AS latest
+                      WHERE latest.streamer = streams.streamer
+                      ORDER BY latest.started_at DESC, latest.id DESC
+                      LIMIT 1
+                  )
+                """,
+                (timestamp, streamer, broadcast_id),
+            )
+            return cursor.rowcount > 0
+
     def open_broadcast(self, streamer):
         streamer = _clean_streamer(streamer)
         if not streamer:
