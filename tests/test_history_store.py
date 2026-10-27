@@ -118,6 +118,26 @@ def test_streamer_detail_and_activity(store):
     assert cell["live_seconds"] == 3600
 
 
+def test_resume_stream_session_reopens_only_the_newest_broadcast(store):
+    store.start_watch_session("alice", "points", NOW)
+    store.upsert_stream_session("alice", "b1", NOW, ended_at=NOW + 60)
+
+    assert store.resume_stream_session("alice", "b1", timestamp=NOW + 70) is True
+    item = store.sessions(kind="stream", days=1, now=NOW + 90)["sessions"][0]
+    assert item["active"] is True
+    assert item["started_at"] == NOW
+    assert item["last_seen_at"] == NOW + 70
+
+    # A newer broadcast must never be replaced by an older one.
+    store.upsert_stream_session("alice", "b2", NOW + 100)
+    assert store.resume_stream_session("alice", "b1", timestamp=NOW + 300) is False
+    active = {
+        row["broadcast_id"]: row["active"]
+        for row in store.sessions(kind="stream", days=1, now=NOW + 400)["sessions"]
+    }
+    assert active == {"b1": False, "b2": True}
+
+
 def test_prune_untracked_streams_removes_live_only_rows(store):
     store.start_watch_session("alice", "points", NOW)
     store.upsert_stream_session("alice", "a1", NOW, ended_at=NOW + 10)
