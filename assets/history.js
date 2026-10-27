@@ -58,6 +58,13 @@
         return hours + 'h ' + String(minutes).padStart(2, '0') + 'm';
     }
 
+    function formatHours(value) {
+        var hours = Number(value);
+        if (!Number.isFinite(hours)) return '0h';
+        // Keep chart axis labels readable: at most two decimals, no float noise.
+        return String(Number(hours.toFixed(2))) + 'h';
+    }
+
     function formatTime(timestamp) {
         var value = Number(timestamp);
         if (!Number.isFinite(value) || value <= 0) return '—';
@@ -479,7 +486,7 @@
         var gains = rows.map(function (row) { return Number(row.points_gained) || 0; });
         var spent = rows.map(function (row) { return -(Number(row.points_spent) || 0); });
         var watchHours = rows.map(function (row) {
-            return Math.round(((Number(row.watch_seconds) || 0) / 3600) * 10) / 10;
+            return Number(((Number(row.watch_seconds) || 0) / 3600).toFixed(2));
         });
         var foreColor = chartForeColor();
 
@@ -527,10 +534,19 @@
                 stroke: { curve: 'smooth', width: 2 },
                 fill: { opacity: 0.25 },
                 xaxis: { categories: categories, labels: { rotate: -45 } },
-                yaxis: { labels: { formatter: function (value) { return value + 'h'; } } },
+                yaxis: { labels: { formatter: function (value) { return formatHours(value); } } },
                 tooltip: {
                     theme: chartTooltipTheme(),
-                    y: { formatter: function (value) { return formatDuration(value * 3600); } }
+                    y: {
+                        formatter: function (value, opts) {
+                            var index = opts && typeof opts.dataPointIndex === 'number'
+                                ? opts.dataPointIndex
+                                : -1;
+                            var row = rows[index];
+                            if (row) return formatDuration(row.watch_seconds);
+                            return formatDuration(value * 3600);
+                        }
+                    }
                 },
                 noData: { text: 'No watch time recorded in this window.' }
             });
@@ -618,9 +634,9 @@
                 badges.push('<span class="tag is-info is-light">watching: ' +
                     escapeHtml(reasonLabel(item.active_watch.reason)) + '</span>');
             }
-            if (item.last_streak_at) {
-                badges.push('<span class="tag is-warning is-light" title="Last streak: ' +
-                    escapeHtml(formatTime(item.last_streak_at)) + '">streak</span>');
+            if (item.live_streak_at) {
+                badges.push('<span class="tag is-warning is-light" title="Streak claimed this live: ' +
+                    escapeHtml(formatTime(item.live_streak_at)) + '">streak</span>');
             }
             return '<tr>' +
                 '<td><a href="#" data-history-streamer="' + escapeHtml(item.streamer) + '">' +
