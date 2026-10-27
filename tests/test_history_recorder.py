@@ -194,7 +194,7 @@ def test_recorder_ignores_live_sessions_until_streamer_is_watched(recorder):
 
     path = os.path.join(recorder.analytics_path, "now_watching.json")
     clock.value = NOW + 40
-    _write_json(path, [{"username": "bob", "reason": "drops"}], clock.value)
+    _write_json(path, [{"username": "bob", "reason": "points"}], clock.value)
     recorder._poll_now_watching()
 
     streams = recorder.store.sessions(kind="stream", days=1, now=clock.value)
@@ -422,3 +422,267 @@ def test_recorder_reason_change_starts_a_new_watch_session(recorder):
     assert sessions["total"] == 2
     reasons = sorted(item["reason"] for item in sessions["sessions"])
     assert reasons == ["points", "streak"]
+
+
+def test_recorder_marks_every_online_streamer_as_live_after_restart(tmp_path):
+    analytics = tmp_path / "analytics"
+    analytics.mkdir()
+    cache = tmp_path / "watch_streak_cache.alice.json"
+    store = HistoryStore(analytics / "history.sqlite3")
+    store.initialize()
+    # bob was watched before the restart, carol only has imported point history
+    # from a build that predates the watch-session tables.
+    store.start_watch_session("bob", "points", NOW)
+    store.upsert_stream_session("bob", "b1", NOW, last_seen_at=NOW + 30)
+    store.record_points("carol", NOW, balance=500, delta=50)
+    # dave was watched too, but he is offline now.
+    store.start_watch_session("dave", "points", NOW)
+    store.upsert_stream_session("dave", "d1", NOW, last_seen_at=NOW + 30)
+    _write_json(
+        cache,
+        {
+            "version": 1,
+            "sessions": [
+                {
+                    "account_name": "alice",
+                    "streamer_login": "bob",
+                    "broadcast_id": "b1",
+                    "started_at": NOW,
+                    "claimed": True,
+                    "claimed_at": NOW + 120,
+                    "ended_at": None,
+                },
+                {
+                    "account_name": "alice",
+                    "streamer_login": "carol",
+                    "broadcast_id": "c1",
+                    "started_at": NOW,
+                    "claimed": False,
+                    "claimed_at": None,
+                    "ended_at": None,
+                },
+                {
+                    "account_name": "alice",
+                    "streamer_login": "dave",
+                    "broadcast_id": "d1",
+                    "started_at": NOW,
+                    "claimed": False,
+                    "claimed_at": None,
+                    "ended_at": NOW + 60,
+                },
+                {
+                    "account_name": "alice",
+                    "streamer_login": "eve",
+                    "broadcast_id": "e1",
+                    "started_at": NOW,
+                    "claimed": False,
+                    "claimed_at": None,
+                    "ended_at": None,
+                },
+            ],
+        },
+        NOW + 10,
+    )
+
+    clock = FakeClock(NOW + 100)
+    recorder = HistoryRecorder(
+        store,
+        analytics_path=analytics,
+        streak_cache_path=cache,
+        username="alice",
+        clock=clock,
+        online_streamers=lambda: [
+            {"username": "bob", "broadcast_id": "b1", "online_at": NOW + 100},
+            {"username": "carol", "broadcast_id": "c1", "online_at": NOW + 100},
+            {"username": "dave", "broadcast_id": "d1", "is_online": False},
+            {"username": "eve", "broadcast_id": "e1", "online_at": NOW + 100},
+        ],
+    )
+    recorder._prepare()
+    try:
+        assert store.overview(days=1, now=clock.value)["live_streams"] == 0
+
+        recorder._poll_online_streamers(clock.value)
+
+        rows = {
+            item["streamer"]: item for item in store.streamers(days=1, now=clock.value)
+        }
+        # Restarting mid-broadcast keeps the live badge without waiting for the
+        # next offline -> online transition, and the streak claimed on that
+        # broadcast is still reported for it.
+        assert rows["bob"]["live_stream"]["broadcast_id"] == "b1"
+        assert rows["bob"]["live_streak_at"] == NOW + 120
+        # Point history from before the feature existed still proves watching.
+        assert rows["carol"]["live_stream"]["broadcast_id"] == "c1"
+        # Offline and never-tracked streamers must not become phantom live rows.
+        assert rows["dave"]["live_stream"] is None
+        assert "eve" not in rows
+    finally:
+        recorder._shutdown()
+
+
+def test_recorder_accepts_a_live_snapshot_of_streamer_objects(tmp_path):
+    analytics = tmp_path / "analytics"
+    analytics.mkdir()
+    store = HistoryStore(analytics / "history.sqlite3")
+    store.initialize()
+    store.start_watch_session("bob", "points", NOW)
+
+    class _Stream:
+        broadcast_id = "b1"
+        game = {"displayName": "Chess"}
+        title = "Ranked"
+
+    class _Streamer:
+        username = "Bob"
+        is_online = True
+        online_at = NOW + 50
+        stream = _Stream()
+
+    clock = FakeClock(NOW + 100)
+    recorder = HistoryRecorder(
+        store,
+        analytics_path=analytics,
+        streak_cache_path=tmp_path / "missing.json",
+        username="alice",
+        clock=clock,
+        online_streamers=lambda: [_Streamer()],
+    )
+    recorder._prepare()
+    try:
+        recorder._poll_online_streamers(clock.value)
+        rows = {
+            item["streamer"]: item for item in store.streamers(days=1, now=clock.value)
+        }
+        assert rows["bob"]["live_stream"]["broadcast_id"] == "b1"
+        assert rows["bob"]["live_stream"]["game"] == "Chess"
+        assert rows["bob"]["live_stream"]["title"] == "Ranked"
+    finally:
+        recorder._shutdown()
+
+
+def test_recorder_skips_watches_recorded_only_for_drops(recorder):
+    clock = recorder.clock
+    clock.value = NOW + 40
+    path = os.path.join(recorder.analytics_path, "now_watching.json")
+    _write_json(
+        path,
+        [
+            {"username": "bob", "reason": "points"},
+            {"username": "carol", "reason": "drops"},
+            {"username": "dave", "reason": "badge"},
+        ],
+        clock.value,
+    )
+
+    recorder._poll_now_watching()
+
+    streamers = [
+        item["streamer"] for item in recorder.store.streamers(days=1, now=clock.value)
+    ]
+    # Only the configured/follower watch survives; category and badge farming
+    # channels must not create history rows.
+    assert streamers == ["bob"]
+    sessions = recorder.store.sessions(kind="watch", days=1, now=clock.value)
+    assert [item["streamer"] for item in sessions["sessions"]] == ["bob"]
+    assert "carol" not in recorder._tracked_streamers
+    assert "dave" not in recorder._tracked_streamers
+
+
+def test_recorder_skips_streamers_reported_as_drop_farmed(tmp_path):
+    analytics = tmp_path / "analytics"
+    analytics.mkdir()
+    store = HistoryStore(analytics / "history.sqlite3")
+    clock = FakeClock(NOW + 40)
+    recorder = HistoryRecorder(
+        store,
+        analytics_path=analytics,
+        streak_cache_path=tmp_path / "missing.json",
+        username="alice",
+        clock=clock,
+        drop_streamers=lambda: ["Carol"],
+    )
+    recorder._prepare()
+    try:
+        path = os.path.join(analytics, "now_watching.json")
+        _write_json(
+            path,
+            [
+                {"username": "bob", "reason": "points"},
+                # The reason alone would look like a normal watch, but the
+                # miner reported the channel as a Drops discovery.
+                {"username": "carol", "reason": "points"},
+            ],
+            clock.value,
+        )
+
+        recorder._poll_now_watching()
+
+        streamers = [
+            item["streamer"] for item in store.streamers(days=1, now=clock.value)
+        ]
+        assert streamers == ["bob"]
+    finally:
+        recorder._shutdown()
+
+
+def test_prepare_removes_legacy_drop_farmed_streamers(tmp_path):
+    analytics = tmp_path / "analytics"
+    analytics.mkdir()
+    store = HistoryStore(analytics / "history.sqlite3")
+    store.initialize()
+    # A previous build recorded a category farming channel as a normal watch.
+    store.start_watch_session("bob", "drops", NOW)
+    store.upsert_stream_session("bob", "b1", NOW)
+    store.start_watch_session("carol", "points", NOW)
+
+    recorder = HistoryRecorder(
+        store,
+        analytics_path=analytics,
+        streak_cache_path=tmp_path / "missing.json",
+        username="alice",
+        clock=FakeClock(NOW + 60),
+    )
+    recorder._prepare()
+    try:
+        streamers = [item["streamer"] for item in store.streamers(days=1, now=NOW + 60)]
+        assert streamers == ["carol"]
+        assert recorder._tracked_streamers == {"carol"}
+    finally:
+        recorder._shutdown()
+
+
+def test_recorder_ignores_analytics_written_for_drop_farmed_streamers(tmp_path):
+    analytics = tmp_path / "analytics"
+    analytics.mkdir()
+    store = HistoryStore(analytics / "history.sqlite3")
+    clock = FakeClock(NOW + 60)
+    recorder = HistoryRecorder(
+        store,
+        analytics_path=analytics,
+        streak_cache_path=tmp_path / "missing.json",
+        username="alice",
+        clock=clock,
+        drop_streamers=lambda: ["carol"],
+    )
+    recorder._prepare()
+    try:
+        _write_json(
+            os.path.join(analytics, "carol.json"),
+            {
+                "version": 1,
+                "series": [
+                    {"x": int(NOW * 1000), "y": 1000, "z": "Watch"},
+                    {"x": int((NOW + 30) * 1000), "y": 1050, "z": "Watch"},
+                ],
+            },
+            NOW + 1,
+        )
+
+        recorder._refresh_streamer_state()
+        recorder._ingest_analytics(NOW + 60)
+
+        assert store.streamers(days=1, now=clock.value) == []
+        assert store.overview(days=1, now=clock.value)["window"]["points_gained"] == 0
+    finally:
+        recorder._shutdown()

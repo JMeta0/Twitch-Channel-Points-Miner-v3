@@ -24,6 +24,7 @@ from TwitchChannelPointsMiner.classes.entities.Streamer import (
     Streamer,
     StreamerSettings,
     discovery_sources,
+    is_drop_discovered,
 )
 from TwitchChannelPointsMiner.classes.Exceptions import (
     CategoryLookupFailedException,
@@ -616,7 +617,15 @@ class TwitchChannelPointsMiner:
         if Settings.enable_analytics is True:
             from TwitchChannelPointsMiner.history import start_history
 
-            start_history(self.username)
+            start_history(
+                self.username,
+                online_streamers=lambda: list(self.streamers),
+                drop_streamers=lambda: [
+                    streamer.username
+                    for streamer in self.streamers
+                    if is_drop_discovered(streamer)
+                ],
+            )
             from TwitchChannelPointsMiner.classes.AnalyticsServer import AnalyticsServer
 
             days_ago = days_ago if days_ago <= 365 * 15 else 365 * 15
