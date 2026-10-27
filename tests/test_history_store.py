@@ -179,3 +179,92 @@ def test_delete_streamer_removes_all_tables(store):
     assert counts["points"] == 1
     assert store.overview(days=30, now=NOW)["window"]["streamers"] == 1
     assert os.path.isfile(store.path)
+
+
+def _streamer_rows(store, now):
+    return {item["streamer"]: item for item in store.streamers(days=1, now=now)}
+
+
+def test_streamers_flag_streak_claimed_during_the_current_live(store):
+    store.upsert_stream_session("alice", "b1", NOW)
+    assert store.record_event(
+        "alice",
+        NOW + 60,
+        "watch_streak",
+        "Watch streak claimed",
+        metadata={"broadcast_id": "b1", "started_at": NOW},
+    )
+
+    item = _streamer_rows(store, NOW + 120)["alice"]
+    assert item["live_stream"]["broadcast_id"] == "b1"
+    assert item["last_streak_at"] == NOW + 60
+    assert item["live_streak_at"] == NOW + 60
+
+
+def test_streamers_hide_streak_from_a_previous_broadcast(store):
+    store.upsert_stream_session("alice", "b1", NOW, ended_at=NOW + 100)
+    store.record_event(
+        "alice",
+        NOW + 60,
+        "watch_streak",
+        "Watch streak claimed",
+        metadata={"broadcast_id": "b1", "started_at": NOW},
+    )
+    store.upsert_stream_session("alice", "b2", NOW + 200)
+
+    item = _streamer_rows(store, NOW + 300)["alice"]
+    assert item["live_stream"]["broadcast_id"] == "b2"
+    assert item["last_streak_at"] == NOW + 60
+    assert item["live_streak_at"] is None
+
+
+def test_streamers_hide_streak_when_the_streamer_is_offline(store):
+    store.upsert_stream_session("alice", "b1", NOW, ended_at=NOW + 100)
+    store.record_event(
+        "alice",
+        NOW + 60,
+        "watch_streak",
+        "Watch streak claimed",
+        metadata={"broadcast_id": "b1", "started_at": NOW},
+    )
+
+    item = _streamer_rows(store, NOW + 200)["alice"]
+    assert item["live_stream"] is None
+    assert item["last_streak_at"] == NOW + 60
+    assert item["live_streak_at"] is None
+
+
+def test_streamers_fall_back_to_timestamps_for_legacy_streak_events(store):
+    store.upsert_stream_session("alice", "b1", NOW)
+    store.record_event("alice", NOW + 60, "watch_streak", "+50 - WATCH_STREAK", 50)
+    store.upsert_stream_session("bob", "b2", NOW + 200)
+    store.record_event("bob", NOW + 100, "watch_streak", "+50 - WATCH_STREAK", 50)
+
+    rows = _streamer_rows(store, NOW + 300)
+    assert rows["alice"]["live_streak_at"] == NOW + 60
+    # bob's claim predates the broadcast he is live with now.
+    assert rows["bob"]["live_streak_at"] is None
+
+
+def test_prune_drop_farmed_streamers_keeps_configured_history(store):
+    # alice was watched for points, bob only for category Drops and carol only
+    # for a badge campaign.
+    store.start_watch_session("alice", "points", NOW)
+    store.record_points("alice", NOW + 30, balance=150, delta=50)
+    store.start_watch_session("bob", "drops", NOW)
+    store.upsert_stream_session("bob", "b1", NOW)
+    store.start_watch_session("carol", "badge", NOW)
+    store.record_points("carol", NOW + 30, balance=100, delta=10)
+    # dave has mixed history: a Drops watch plus a configured one.
+    store.start_watch_session("dave", "drops", NOW)
+    store.start_watch_session("dave", "points", NOW + 60)
+
+    counts = store.prune_drop_farmed_streamers()
+
+    assert counts["watch_sessions"] == 2
+    assert counts["streams"] == 1
+    assert counts["points"] == 1
+    remaining = {item["streamer"] for item in store.streamers(days=1, now=NOW + 120)}
+    assert remaining == {"alice", "dave"}
+    sessions = store.sessions(kind="watch", days=1, now=NOW + 120)
+    assert {item["streamer"] for item in sessions["sessions"]} == {"alice", "dave"}
