@@ -63,8 +63,17 @@ def _resolve_paths(username):
     return analytics_path, cache_path
 
 
-def start_history(username):
+def start_history(username, online_streamers=None, drop_streamers=None):
     """Start the passive recorder once for this process.
+
+    ``online_streamers`` is an optional callable returning the miner's current
+    streamers.  It lets the recorder show the live badge for every online
+    streamer the History tab tracks, including across a restart.
+
+    ``drop_streamers`` is an optional callable returning the usernames the
+    miner only discovered to farm Drops (category, wildcard-category and badge
+    channels).  The History tab only lists configured and follower streamers,
+    so those discovery channels are never recorded.
 
     Returns the recorder, or ``None`` when history is unavailable.  Callers
     must treat failure as non-fatal.
@@ -85,6 +94,8 @@ def start_history(username):
                 username,
                 version=_miner_version(),
                 retention_days=_history_retention_days(),
+                online_streamers=online_streamers,
+                drop_streamers=drop_streamers,
             )
             _store = recorder.store
             recorder.start()
