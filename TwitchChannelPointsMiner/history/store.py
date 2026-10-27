@@ -23,6 +23,15 @@ HISTORY_SCHEMA_VERSION = 1
 DEFAULT_RETENTION_DAYS = 730
 SECONDS_PER_DAY = 24 * 60 * 60
 
+# Watch reasons written for channels the miner only discovered to farm Drops
+# (category, wildcard-category and badge campaigns).  The History tab only
+# lists configured and follower streamers, so these are not real watches.
+DROP_FARM_REASONS = ("drops", "badge")
+
+# Tables holding per-streamer history rows, used by the manual delete and by
+# the automatic cleanup of drop-farmed channels.
+_STREAMER_TABLES = ("points", "events", "watch_sessions", "streams", "daily_stats")
+
 
 def utc_day(timestamp):
     """Return the UTC calendar day for ``timestamp`` as ``YYYY-MM-DD``."""
@@ -38,6 +47,44 @@ def day_start(day):
 
 def _clean_streamer(streamer):
     return str(streamer or "").strip().lower()
+
+
+def _event_broadcast_id(raw_metadata):
+    """Return the broadcast id stored on an event, or ``None`` when absent."""
+
+    if not raw_metadata:
+        return None
+    try:
+        metadata = json.loads(raw_metadata)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    broadcast_id = str(metadata.get("broadcast_id") or "").strip()
+    return broadcast_id or None
+
+
+def _live_streak_at(claims, live_stream):
+    """Return when a streak was claimed during ``live_stream``, if at all.
+
+    Streak events written from the streak cache carry the broadcast id, so a
+    claim from an earlier broadcast can never light up the current one.  Older
+    events predating that metadata fall back to a timestamp comparison.
+    """
+
+    if not claims:
+        return None
+    broadcast_id = str(live_stream.get("broadcast_id") or "").strip()
+    started_at = live_stream.get("started_at")
+    matched = None
+    for timestamp, claim_broadcast_id in claims:
+        if claim_broadcast_id is not None:
+            is_current = bool(broadcast_id) and claim_broadcast_id == broadcast_id
+        else:
+            is_current = started_at is not None and timestamp >= float(started_at)
+        if is_current:
+            matched = timestamp if matched is None else max(matched, timestamp)
+    return matched
 
 
 _SCHEMA_V1 = (
@@ -728,6 +775,56 @@ class HistoryStore(object):
             ).fetchall()
         return {row["streamer"] for row in rows}
 
+    def known_streamers(self):
+        """Return every streamer with recorded history.
+
+        Point and watch history can predate the watch-session tables, so this
+        is broader than :meth:`watched_streamers`.  Live state for these
+        streamers is legitimate: recording points only happens while watching.
+        """
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT streamer FROM daily_stats"
+            ).fetchall()
+        return {row["streamer"] for row in rows}
+
+    def prune_drop_farmed_streamers(self):
+        """Delete history recorded only for Drop-farmed channels.
+
+        Older history builds recorded every category, wildcard and badge
+        discovery channel as a watched streamer, which cluttered the Streamers
+        list with channels the user never configured.  A streamer is dropped
+        only when all of its watch sessions belong to those discovery tiers;
+        configured and follower streamers always have a points/streak session,
+        so their history is never touched.
+        """
+
+        placeholders = ",".join("?" for _ in DROP_FARM_REASONS)
+        counts = {table: 0 for table in _STREAMER_TABLES + ("import_state",)}
+        with self._write_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT streamer FROM watch_sessions
+                GROUP BY streamer
+                HAVING SUM(CASE WHEN reason IN ({placeholders}) THEN 0 ELSE 1 END) = 0
+                """,
+                DROP_FARM_REASONS,
+            ).fetchall()
+            for row in rows:
+                streamer = row["streamer"]
+                for table in _STREAMER_TABLES:
+                    cursor = connection.execute(
+                        f"DELETE FROM {table} WHERE streamer = ?", (streamer,)
+                    )
+                    counts[table] += max(0, cursor.rowcount)
+                cursor = connection.execute(
+                    "DELETE FROM import_state WHERE source LIKE ?",
+                    (f"analytics:{streamer}.json:%",),
+                )
+                counts["import_state"] += max(0, cursor.rowcount)
+        return counts
+
     def prune_untracked_streams(self):
         """Drop live-session data for streamers that were never watched.
 
@@ -916,6 +1013,20 @@ class HistoryStore(object):
                     SELECT streamer, MAX(ts) AS ts FROM events
                     WHERE type = 'watch_streak' GROUP BY streamer
                     """).fetchall()}
+            streak_claims = {}
+            if live_streams:
+                placeholders = ",".join("?" for _ in live_streams)
+                for row in connection.execute(
+                    f"""
+                    SELECT streamer, ts, metadata FROM events
+                    WHERE type = 'watch_streak'
+                      AND streamer IN ({placeholders})
+                    """,
+                    tuple(live_streams),
+                ).fetchall():
+                    streak_claims.setdefault(row["streamer"], []).append(
+                        (float(row["ts"]), _event_broadcast_id(row["metadata"]))
+                    )
         result = []
         for row in rows:
             item = dict(row)
@@ -924,6 +1035,11 @@ class HistoryStore(object):
             item["active_watch"] = active_watch.get(streamer)
             item["live_stream"] = live_streams.get(streamer)
             item["last_streak_at"] = last_streak.get(streamer)
+            item["live_streak_at"] = (
+                _live_streak_at(streak_claims.get(streamer), item["live_stream"])
+                if item["live_stream"] is not None
+                else None
+            )
             observed = [item.get("last_seen")]
             if item["active_watch"] is not None:
                 observed.append(item["active_watch"].get("last_seen_at"))
@@ -1274,13 +1390,7 @@ class HistoryStore(object):
             return {}
         counts = {}
         with self._write_connection() as connection:
-            for table in (
-                "points",
-                "events",
-                "watch_sessions",
-                "streams",
-                "daily_stats",
-            ):
+            for table in _STREAMER_TABLES:
                 cursor = connection.execute(
                     f"DELETE FROM {table} WHERE streamer = ?", (streamer,)
                 )

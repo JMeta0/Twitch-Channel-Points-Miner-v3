@@ -5,6 +5,17 @@ needs is already written by the miner: the per-streamer chart JSON, the
 ``now_watching`` snapshot, and the account-scoped watch-streak cache.  Polling
 those files keeps the feature independent from upstream mining code, which
 makes rebasing a fork much less painful.
+
+The optional ``online_streamers`` callable is a read-only snapshot of the
+miner's streamers.  The streak cache only reports broadcasts the miner has
+already seen, so it cannot tell whether a broadcast survived a restart; the
+live snapshot can, and it keeps the live badge accurate for every streamer the
+History tab tracks, not just the one currently being watched.
+
+The optional ``drop_streamers`` callable names the channels the miner only
+discovered to farm Drops (category, wildcard-category and badge campaigns).
+Those watches are not configured streamers, so they are never recorded and
+never appear in the Streamers list.
 """
 
 import json
@@ -16,6 +27,7 @@ import time
 
 from TwitchChannelPointsMiner.history.store import (
     DEFAULT_RETENTION_DAYS,
+    DROP_FARM_REASONS,
     HistoryStore,
 )
 
@@ -37,6 +49,16 @@ _POINTS_PATTERN = re.compile(r"([+-]\d+)")
 
 def _clean_streamer(value):
     return str(value or "").strip().lower()
+
+
+def _streamer_name(value):
+    """Return a normalised username from a dict or miner Streamer object."""
+
+    if isinstance(value, dict):
+        name = value.get("username") or value.get("streamer")
+    else:
+        name = getattr(value, "username", None)
+    return _clean_streamer(name)
 
 
 def _read_json(path):
@@ -100,6 +122,8 @@ class HistoryRecorder(threading.Thread):
         interval=ANALYTICS_POLL_SECONDS,
         retention_days=DEFAULT_RETENTION_DAYS,
         clock=time.time,
+        online_streamers=None,
+        drop_streamers=None,
     ):
         super(HistoryRecorder, self).__init__()
         self.daemon = True
@@ -112,6 +136,8 @@ class HistoryRecorder(threading.Thread):
         self.interval = max(1.0, float(interval))
         self.retention_days = retention_days
         self.clock = clock
+        self.online_streamers = online_streamers
+        self.drop_streamers = drop_streamers
         self._stop_event = threading.Event()
         self._active_watch = {}
         self._now_watching_initialized = False
@@ -119,9 +145,14 @@ class HistoryRecorder(threading.Thread):
         self._run_id = None
         self._next_retention_at = 0.0
         self._streak_cache_key = None
-        self._watched_streamers = set()
+        self._tracked_streamers = set()
         self._cached_stream_sessions = []
         self._cache_startup_closed = set()
+        self._online_live_keys = set()
+        self._drop_farmed = set()
+        self._live_streamer_names = set()
+        self._streamer_snapshot = None
+        self._streamer_state_ready = False
 
     # -- lifecycle ---------------------------------------------------------
     def stop(self):
@@ -143,12 +174,21 @@ class HistoryRecorder(threading.Thread):
         # A session open in the database belongs to a previous process.  Close
         # it at its last observed time rather than letting it grow forever.
         # If the miner restarted mid-broadcast, the row is reopened once that
-        # broadcast is watched again (_resume_cached_live_stream).
+        # broadcast is watched again (_resume_cached_live_stream) or reported
+        # online by the live snapshot (_poll_online_streamers).
         self.store.close_open_watch_sessions(now)
         self.store.close_open_streams(now)
         self.store.close_open_runs()
-        self._watched_streamers = self.store.watched_streamers()
         self.store.prune_untracked_streams()
+        # Older builds recorded every drop-farmed channel, but the History tab
+        # only lists configured and follower streamers.  Drop those legacy rows
+        # before the tracked set is rebuilt from what remains.
+        self.store.prune_drop_farmed_streamers()
+        # Point/watch history can predate the watch-session tables, so keep
+        # live state for every streamer the History tab can display.
+        self._tracked_streamers = (
+            self.store.watched_streamers() | self.store.known_streamers()
+        )
         self._run_id = self.store.start_run(self.version, started_at=now)
         self._next_retention_at = now
         # The cache may carry an open session from an old crash.  Import those
@@ -171,9 +211,11 @@ class HistoryRecorder(threading.Thread):
         now = self.clock()
         self.store.heartbeat_run(self._run_id, now)
         self.store.touch_open_streams(now)
+        self._refresh_streamer_state()
         self._ingest_streak_cache(now)
         self._poll_now_watching(now)
         self._ingest_analytics(now)
+        self._poll_online_streamers(now)
         if now >= self._next_retention_at:
             self._apply_retention(now)
 
@@ -183,6 +225,60 @@ class HistoryRecorder(threading.Thread):
             self.store.apply_retention(now=now, retention_days=self.retention_days)
         except Exception as error:
             logger.warning("Unable to apply history retention: %s", error)
+
+    # -- miner streamer snapshot -------------------------------------------
+    def _refresh_streamer_state(self):
+        """Read which streamers are live and which exist only for Drops.
+
+        Both providers are lazy because the miner starts the analytics server
+        before it loads its streamers.  A failed provider keeps the previous
+        state instead of clearing it, so one bad poll cannot re-enable
+        recording for drop-farmed channels.
+        """
+
+        streamers = self._provider_value(self.online_streamers)
+        if streamers is not None:
+            self._streamer_snapshot = streamers
+            self._live_streamer_names = {
+                name for name in (_streamer_name(item) for item in streamers) if name
+            }
+        drop_streamers = self._provider_value(self.drop_streamers)
+        if drop_streamers is not None:
+            self._drop_farmed = {
+                name
+                for name in (_clean_streamer(value) for value in drop_streamers)
+                if name
+            }
+        self._streamer_state_ready = True
+
+    @staticmethod
+    def _provider_value(provider):
+        if provider is None:
+            return None
+        try:
+            values = provider()
+        except Exception:
+            logger.debug("Unable to read miner streamer state", exc_info=True)
+            return None
+        if values is None:
+            return None
+        return list(values)
+
+    def _is_drop_farmed(self, streamer, reason=None):
+        """True when this watch belongs to an auto-discovered Drops channel."""
+
+        streamer = _clean_streamer(streamer)
+        if not streamer:
+            return False
+        if streamer in self._drop_farmed:
+            return True
+        if reason is None:
+            return False
+        if str(reason).strip().lower() not in DROP_FARM_REASONS:
+            return False
+        # The live snapshot proves a configured/follower streamer; without it
+        # the watch reason is the only signal available.
+        return streamer not in self._live_streamer_names
 
     # -- now_watching ------------------------------------------------------
     def _now_watching_path(self):
@@ -199,6 +295,8 @@ class HistoryRecorder(threading.Thread):
 
     def _poll_now_watching(self, now=None):
         now = self.clock() if now is None else float(now)
+        if not self._streamer_state_ready:
+            self._refresh_streamer_state()
         path = self._now_watching_path()
         try:
             mtime = os.path.getmtime(path)
@@ -230,9 +328,13 @@ class HistoryRecorder(threading.Thread):
             streamer = _clean_streamer(entry.get("username"))
             if not streamer:
                 continue
+            reason = str(entry.get("reason") or "points").strip().lower()
+            if self._is_drop_farmed(streamer, reason):
+                # Channels discovered only for category/badge Drops are not
+                # configured streamers, so they must not enter the history.
+                continue
             seen.add(streamer)
             self._resume_cached_live_stream(streamer, now)
-            reason = str(entry.get("reason") or "points").strip().lower()
             game = entry.get("game") or None
             active = self._active_watch.get(streamer)
             if active is not None and active["reason"] == reason:
@@ -240,7 +342,7 @@ class HistoryRecorder(threading.Thread):
             else:
                 if active is not None:
                     self._close_watch(streamer, now)
-                self._watched_streamers.add(streamer)
+                self._tracked_streamers.add(streamer)
                 self._import_cached_sessions(streamer, now)
                 session_id = self.store.start_watch_session(
                     streamer,
@@ -278,6 +380,101 @@ class HistoryRecorder(threading.Thread):
         if active is None:
             return
         self.store.end_watch_session(active["id"], ended_at=ended_at)
+
+    # -- live streamers ----------------------------------------------------
+    def _poll_online_streamers(self, now):
+        """Mark every online streamer the miner reports as live.
+
+        The streak cache only knows broadcasts the miner has already observed.
+        After a restart its open entries are closed on purpose so a crashed run
+        cannot leave phantom live rows, which meant only streamers watched
+        again in the new process kept a live badge.  The live snapshot proves a
+        broadcast is online, so it reopens those rows for every tracked
+        streamer - not only the one currently being watched.
+        """
+
+        entries = self._online_stream_entries(now)
+        if not entries:
+            return
+        current = set()
+        for entry in entries:
+            streamer = entry["streamer"]
+            if streamer in self._drop_farmed:
+                continue
+            if streamer not in self._tracked_streamers:
+                continue
+            broadcast_id = entry["broadcast_id"]
+            key = (streamer, broadcast_id)
+            current.add(key)
+            if key in self._online_live_keys:
+                continue
+            self.store.upsert_stream_session(
+                streamer,
+                broadcast_id,
+                started_at=entry["started_at"],
+                last_seen_at=now,
+                title=entry["title"],
+                game=entry["game"],
+                source="online",
+            )
+            self.store.resume_stream_session(streamer, broadcast_id, timestamp=now)
+            # The snapshot proves the broadcast is live, so the startup guard
+            # must not close the cached session again.
+            self._cache_startup_closed.discard(key)
+            self._online_live_keys.add(key)
+        self._online_live_keys &= current
+
+    def _online_stream_entries(self, now):
+        if not self._streamer_state_ready:
+            self._refresh_streamer_state()
+        streamers = self._streamer_snapshot
+        if not streamers:
+            return []
+        entries = []
+        for streamer in list(streamers):
+            entry = self._online_stream_entry(streamer, now)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _online_stream_entry(streamer, now):
+        if isinstance(streamer, dict):
+            username = streamer.get("username") or streamer.get("streamer")
+            broadcast_id = streamer.get("broadcast_id")
+            started_at = streamer.get("online_at") or streamer.get("started_at")
+            game = streamer.get("game")
+            title = streamer.get("title")
+            is_online = streamer.get("is_online", True)
+        else:
+            stream = getattr(streamer, "stream", None)
+            username = getattr(streamer, "username", None)
+            broadcast_id = getattr(stream, "broadcast_id", None)
+            started_at = getattr(streamer, "online_at", None)
+            game = getattr(stream, "game", None)
+            title = getattr(stream, "title", None)
+            is_online = getattr(streamer, "is_online", True)
+        if is_online is not True:
+            return None
+        username = _clean_streamer(username)
+        broadcast_id = str(broadcast_id or "").strip()
+        if not username or not broadcast_id:
+            return None
+        try:
+            started_at = float(started_at or 0)
+        except (TypeError, ValueError):
+            started_at = 0.0
+        if started_at <= 0:
+            started_at = float(now)
+        if isinstance(game, dict):
+            game = game.get("displayName") or game.get("name") or None
+        return {
+            "streamer": username,
+            "broadcast_id": broadcast_id,
+            "started_at": started_at,
+            "game": str(game) if game else None,
+            "title": str(title) if title else None,
+        }
 
     # -- watch-streak cache ------------------------------------------------
     def _ingest_streak_cache(self, now=None, close_open=False, force=False):
@@ -338,14 +535,16 @@ class HistoryRecorder(threading.Thread):
                 }
             )
 
-            if parsed[-1]["claimed"]:
+            if parsed[-1]["claimed"] and streamer not in self._drop_farmed:
                 # A streak claim proves the streamer was watched, even if this
                 # history database predates the watch-session tables.
-                self._watched_streamers.add(streamer)
+                self._tracked_streamers.add(streamer)
 
         self._cached_stream_sessions = parsed
         for item in parsed:
-            if item["streamer"] not in self._watched_streamers:
+            if item["streamer"] in self._drop_farmed:
+                continue
+            if item["streamer"] not in self._tracked_streamers:
                 continue
             self._store_cached_session(item, now, close_open=close_open)
             self._record_cached_streak(item)
@@ -368,6 +567,10 @@ class HistoryRecorder(threading.Thread):
             last_seen_at=now if ended_at is None else ended_at,
             source="streak_cache",
         )
+        if ended_at is not None:
+            # Let the next live snapshot reopen the row when the miner still
+            # reports the broadcast as online.
+            self._online_live_keys.discard(key)
 
     def _record_cached_streak(self, item):
         if not item.get("claimed") or item.get("claimed_at") is None:
@@ -443,9 +646,15 @@ class HistoryRecorder(threading.Thread):
         return result
 
     def _ingest_analytics(self, now=None):
+        if not self._streamer_state_ready:
+            self._refresh_streamer_state()
         for filename, path in self._analytics_files():
             streamer = _clean_streamer(filename[: -len(".json")])
             if not streamer:
+                continue
+            if streamer in self._drop_farmed:
+                # Points written for a channel farmed only for Drops do not
+                # belong to a configured streamer's history.
                 continue
             try:
                 stat = os.stat(path)
@@ -468,6 +677,7 @@ class HistoryRecorder(threading.Thread):
                 continue
             if not isinstance(payload, dict):
                 continue
+            self._tracked_streamers.add(streamer)
 
             if not series_fresh:
                 self._ingest_series(
@@ -626,6 +836,8 @@ def build_recorder(
     version=None,
     retention_days=DEFAULT_RETENTION_DAYS,
     interval=ANALYTICS_POLL_SECONDS,
+    online_streamers=None,
+    drop_streamers=None,
 ):
     store = HistoryStore(os.path.join(analytics_path, "history.sqlite3"))
     recorder = HistoryRecorder(
@@ -636,5 +848,7 @@ def build_recorder(
         version=version,
         interval=interval,
         retention_days=retention_days,
+        online_streamers=online_streamers,
+        drop_streamers=drop_streamers,
     )
     return recorder
