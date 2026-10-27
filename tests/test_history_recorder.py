@@ -234,6 +234,174 @@ def test_recorder_imports_streak_cache_sessions(recorder):
     assert events["events"][0]["type"] == "watch_streak"
 
 
+def test_recorder_restores_live_badge_for_a_broadcast_it_restarted_into(tmp_path):
+    analytics = tmp_path / "analytics"
+    analytics.mkdir()
+    cache = tmp_path / "watch_streak_cache.alice.json"
+    store = HistoryStore(analytics / "history.sqlite3")
+    store.initialize()
+    # A previous run watched bob on broadcast b1 and then stopped.
+    store.start_watch_session("bob", "points", NOW)
+    store.upsert_stream_session("bob", "b1", NOW, last_seen_at=NOW + 30)
+    _write_json(
+        cache,
+        {
+            "version": 1,
+            "sessions": [
+                {
+                    "account_name": "alice",
+                    "streamer_login": "bob",
+                    "broadcast_id": "b1",
+                    "started_at": NOW,
+                    "claimed": False,
+                    "claimed_at": None,
+                    "ended_at": None,
+                }
+            ],
+        },
+        NOW + 10,
+    )
+
+    clock = FakeClock(NOW + 100)
+    recorder = HistoryRecorder(
+        store,
+        analytics_path=analytics,
+        streak_cache_path=cache,
+        username="alice",
+        clock=clock,
+    )
+    recorder._prepare()
+    try:
+        # The stale cache entry must not become a phantom live row.
+        assert store.overview(days=1, now=clock.value)["live_streams"] == 0
+
+        # Watching bob again proves the cached broadcast is still live.
+        now_watching = os.path.join(analytics, "now_watching.json")
+        clock.value = NOW + 160
+        _write_json(
+            now_watching,
+            [{"username": "bob", "reason": "points"}],
+            clock.value,
+        )
+        recorder._poll_now_watching()
+
+        assert store.overview(days=1, now=clock.value)["live_streams"] == 1
+        streamers = store.streamers(days=1, now=clock.value)
+        assert streamers[0]["streamer"] == "bob"
+        assert streamers[0]["live_stream"] is not None
+        assert streamers[0]["live_stream"]["broadcast_id"] == "b1"
+
+        # The miner noticing the streamer offline closes the row again.
+        clock.value = NOW + 400
+        _write_json(
+            cache,
+            {
+                "version": 1,
+                "sessions": [
+                    {
+                        "account_name": "alice",
+                        "streamer_login": "bob",
+                        "broadcast_id": "b1",
+                        "started_at": NOW,
+                        "claimed": False,
+                        "claimed_at": None,
+                        "ended_at": NOW + 380,
+                    }
+                ],
+            },
+            clock.value,
+        )
+        recorder._ingest_streak_cache()
+
+        assert store.overview(days=1, now=clock.value)["live_streams"] == 0
+        assert store.streamers(days=1, now=clock.value)[0]["live_stream"] is None
+    finally:
+        recorder._shutdown()
+
+
+def test_recorder_does_not_resume_a_broadcast_that_ended_while_offline(tmp_path):
+    analytics = tmp_path / "analytics"
+    analytics.mkdir()
+    cache = tmp_path / "watch_streak_cache.alice.json"
+    store = HistoryStore(analytics / "history.sqlite3")
+    store.initialize()
+    store.start_watch_session("bob", "points", NOW)
+    store.upsert_stream_session("bob", "b1", NOW, last_seen_at=NOW + 30)
+    _write_json(
+        cache,
+        {
+            "version": 1,
+            "sessions": [
+                {
+                    "account_name": "alice",
+                    "streamer_login": "bob",
+                    "broadcast_id": "b1",
+                    "started_at": NOW,
+                    "claimed": False,
+                    "claimed_at": None,
+                    "ended_at": None,
+                }
+            ],
+        },
+        NOW + 10,
+    )
+
+    clock = FakeClock(NOW + 100)
+    recorder = HistoryRecorder(
+        store,
+        analytics_path=analytics,
+        streak_cache_path=cache,
+        username="alice",
+        clock=clock,
+    )
+    recorder._prepare()
+    try:
+        # bob is watched again, but on a new broadcast b2.
+        now_watching = os.path.join(analytics, "now_watching.json")
+        clock.value = NOW + 200
+        store.upsert_stream_session("bob", "b2", NOW + 150)
+        _write_json(
+            cache,
+            {
+                "version": 1,
+                "sessions": [
+                    {
+                        "account_name": "alice",
+                        "streamer_login": "bob",
+                        "broadcast_id": "b1",
+                        "started_at": NOW,
+                        "claimed": False,
+                        "claimed_at": None,
+                        "ended_at": NOW + 140,
+                    },
+                    {
+                        "account_name": "alice",
+                        "streamer_login": "bob",
+                        "broadcast_id": "b2",
+                        "started_at": NOW + 150,
+                        "claimed": False,
+                        "claimed_at": None,
+                        "ended_at": None,
+                    },
+                ],
+            },
+            clock.value,
+        )
+        recorder._ingest_streak_cache()
+        _write_json(
+            now_watching,
+            [{"username": "bob", "reason": "points"}],
+            clock.value,
+        )
+        recorder._poll_now_watching()
+
+        sessions = store.sessions(kind="stream", days=1, now=clock.value)
+        active = {item["broadcast_id"]: item["active"] for item in sessions["sessions"]}
+        assert active == {"b1": False, "b2": True}
+    finally:
+        recorder._shutdown()
+
+
 def test_recorder_reason_change_starts_a_new_watch_session(recorder):
     path = os.path.join(recorder.analytics_path, "now_watching.json")
     clock = recorder.clock

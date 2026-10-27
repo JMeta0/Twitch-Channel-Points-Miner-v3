@@ -141,9 +141,9 @@ class HistoryRecorder(threading.Thread):
         self.store.initialize()
         now = self.clock()
         # A session open in the database belongs to a previous process.  Close
-        # it at its last observed time rather than letting it grow forever.  If
-        # the miner restarted mid-broadcast, the remainder of that broadcast is
-        # intentionally not counted until the next broadcast is observed.
+        # it at its last observed time rather than letting it grow forever.
+        # If the miner restarted mid-broadcast, the row is reopened once that
+        # broadcast is watched again (_resume_cached_live_stream).
         self.store.close_open_watch_sessions(now)
         self.store.close_open_streams(now)
         self.store.close_open_runs()
@@ -153,6 +153,8 @@ class HistoryRecorder(threading.Thread):
         self._next_retention_at = now
         # The cache may carry an open session from an old crash.  Import those
         # as already closed so they cannot become permanent phantom live rows.
+        # Watching that streamer again proves the broadcast is live and
+        # reopens it.
         self._ingest_streak_cache(now, close_open=True, force=True)
         self._baseline_now_watching()
 
@@ -229,6 +231,7 @@ class HistoryRecorder(threading.Thread):
             if not streamer:
                 continue
             seen.add(streamer)
+            self._resume_cached_live_stream(streamer, now)
             reason = str(entry.get("reason") or "points").strip().lower()
             game = entry.get("game") or None
             active = self._active_watch.get(streamer)
@@ -393,6 +396,36 @@ class HistoryRecorder(threading.Thread):
             if item["streamer"] == streamer:
                 self._store_cached_session(item, now, close_open=False)
                 self._record_cached_streak(item)
+
+    def _resume_cached_live_stream(self, streamer, now):
+        """Reopen the broadcast a restarted miner is watching again.
+
+        Sessions still open in the streak cache are closed when the recorder
+        starts, because the miner may have died long ago.  Watching the
+        streamer again proves the cached broadcast is still live, so the row
+        is reopened instead of staying closed until the next broadcast.
+        """
+
+        session = self._open_cached_session(streamer)
+        if session is None:
+            return
+        key = (session["streamer"], session["broadcast_id"])
+        if key not in self._cache_startup_closed:
+            return
+        if self.store.resume_stream_session(
+            session["streamer"], session["broadcast_id"], timestamp=now
+        ):
+            self._cache_startup_closed.discard(key)
+
+    def _open_cached_session(self, streamer):
+        sessions = [
+            item
+            for item in self._cached_stream_sessions
+            if item["streamer"] == streamer and item["ended_at"] is None
+        ]
+        if not sessions:
+            return None
+        return max(sessions, key=lambda item: item["started_at"])
 
     # -- per-streamer analytics JSON --------------------------------------
     def _analytics_files(self):
