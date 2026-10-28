@@ -25,7 +25,10 @@ from TwitchChannelPointsMiner.classes.entities.Streamer import (
     StreamerSettings,
     discovery_sources,
 )
-from TwitchChannelPointsMiner.classes.Exceptions import StreamerDoesNotExistException
+from TwitchChannelPointsMiner.classes.Exceptions import (
+    CategoryLookupFailedException,
+    StreamerDoesNotExistException,
+)
 from TwitchChannelPointsMiner.classes.gql.Errors import RetryError
 from TwitchChannelPointsMiner.classes.gql.Integration import GQLFactory
 from TwitchChannelPointsMiner.classes.Settings import (
@@ -252,6 +255,16 @@ def _capture_drop_progress_baseline(twitch, progress_scraped=False):
 
 
 DAILY_REPORT_STATE_VERSION = 1
+# Consecutive category refreshes a category may stay unevaluated (its lookup
+# kept failing) before it is treated as evaluated: a lookup that never
+# recovers, such as an expired token, must not keep stale streamers forever
+# or hold wildcard discovery off indefinitely.
+CATEGORY_LOOKUP_FAILURE_LIMIT = 3
+# The same bound for badge Drop games. Badge checks run every 5 minutes, so
+# this keeps a failing game's channels for about an hour rather than ten
+# minutes, which would retire a channel still earning a Drop during a brief
+# outage.
+BADGE_LOOKUP_FAILURE_LIMIT = 12
 
 
 def _load_daily_report_state(path):
@@ -322,6 +335,7 @@ def _save_daily_report_state(path, report_date, streamers, drop_progress):
 class TwitchChannelPointsMiner:
     __slots__ = [
         "username",
+        "category_lookup_failure_streaks",
         "twitch",
         "claim_drops_startup",
         "enable_analytics",
@@ -464,6 +478,7 @@ class TwitchChannelPointsMiner:
             _migrate_analytics_data(Settings.analytics_path)
 
         self.username = username
+        self.category_lookup_failure_streaks = {}
 
         # Set as global config
         Settings.logger = logger_settings
@@ -861,22 +876,50 @@ class TwitchChannelPointsMiner:
 
             eligible_categories = []
             all_category_usernames = []
+            category_slugs_by_username = {}
+            # Nothing is tracked yet, so an unevaluated category only means
+            # its discovery is skipped until the first refresh; the flag below
+            # stands the wildcard pass down the way the refresh does instead
+            # of repeating every campaign request only to fail again.
+            discovery_unavailable = (
+                discovery_inventory is not None
+                and not Twitch.drops_inventory_loaded(discovery_inventory)
+            )
+            # Preferred categories left unevaluated (failed campaign or
+            # live-channel lookups) keep the wildcard pass from running too.
+            preferred_unevaluated_slugs = set()
             if categories:
-                eligible_categories = self.twitch.filter_categories_with_active_drops(
-                    categories,
-                    order=category_campaign_order,
-                    drops_enabled=category_drops_enabled,
-                    inventory=discovery_inventory,
+                (
+                    eligible_categories,
+                    preferred_unevaluated_slugs,
+                    campaign_lookup_failed,
+                ) = self.__lookup_campaign_categories(
+                    "configured",
+                    lambda: self.twitch.filter_categories_with_active_drops(
+                        categories,
+                        order=category_campaign_order,
+                        drops_enabled=category_drops_enabled,
+                        inventory=discovery_inventory,
+                    ),
                 )
+                if campaign_lookup_failed:
+                    discovery_unavailable = True
 
                 if categories and eligible_categories == []:
-                    # Keep the two causes apart in the log: a failed inventory
-                    # load is a transient outage, not evidence that no campaign
-                    # is running (same distinction the refresh makes).
+                    # Keep the causes apart in the log: a failed inventory
+                    # load or campaign lookup is a transient outage, not
+                    # evidence that no campaign is running (same distinction
+                    # the refresh makes).
                     if not Twitch.drops_inventory_loaded(discovery_inventory):
                         logger.log(
                             category_log_level,
                             "Skipping category stream discovery: drops inventory unavailable",
+                            extra={"emoji": ":pause_button:", "category_log": True},
+                        )
+                    elif campaign_lookup_failed:
+                        logger.log(
+                            category_log_level,
+                            "Skipping category stream discovery: drop campaign lookup failed",
                             extra={"emoji": ":pause_button:", "category_log": True},
                         )
                     else:
@@ -886,15 +929,20 @@ class TwitchChannelPointsMiner:
                             extra={"emoji": ":sleeping:", "category_log": True},
                         )
 
-                for category in eligible_categories:
-                    all_category_usernames.extend(
-                        self.twitch.get_live_streamers_for_category(
-                            category,
-                            drops_enabled=category_drops_enabled,
-                            limit=category_limit,
-                            sort_by=category_sort,
-                        )
-                    )
+                (
+                    all_category_usernames,
+                    failed_category_slugs,
+                    discovered_slugs_by_username,
+                ) = self.__discover_live_category_streamers(
+                    eligible_categories,
+                    drops_enabled=category_drops_enabled,
+                    limit=category_limit,
+                    sort_by=category_sort,
+                    tracking=False,
+                )
+                preferred_unevaluated_slugs |= failed_category_slugs
+                for username, slugs in discovered_slugs_by_username.items():
+                    category_slugs_by_username.setdefault(username, set()).update(slugs)
 
                 for username in all_category_usernames:
                     category_usernames.add(username)
@@ -910,9 +958,15 @@ class TwitchChannelPointsMiner:
             # right now). This is its own opt-in, lowest-default-priority
             # StreamerSource tier -- see streamer_source_priority -- not a
             # silent extension of CATEGORIES.
-            if self.wildcard_categories and not all_category_usernames:
-                wildcard_eligible_categories = (
-                    self.twitch.get_wildcard_categories_with_active_drops(
+            if (
+                self.wildcard_categories
+                and not all_category_usernames
+                and not discovery_unavailable
+                and not preferred_unevaluated_slugs
+            ):
+                wildcard_eligible_categories, _, _ = self.__lookup_campaign_categories(
+                    "wildcard",
+                    lambda: self.twitch.get_wildcard_categories_with_active_drops(
                         exclude_category_slugs=self.twitch.get_category_slugs(
                             categories
                         ),
@@ -922,18 +976,21 @@ class TwitchChannelPointsMiner:
                         pin_active=self.wildcard_category_pin_active,
                         inventory=discovery_inventory,
                         refresh_external_catalog=True,
-                    )
+                    ),
                 )
-                all_wildcard_category_usernames = []
-                for category in wildcard_eligible_categories:
-                    all_wildcard_category_usernames.extend(
-                        self.twitch.get_live_streamers_for_category(
-                            category,
-                            drops_enabled=category_drops_enabled,
-                            limit=self.wildcard_category_streamer_limit,
-                            sort_by=category_sort,
-                        )
-                    )
+                (
+                    all_wildcard_category_usernames,
+                    _,
+                    discovered_slugs_by_username,
+                ) = self.__discover_live_category_streamers(
+                    wildcard_eligible_categories,
+                    drops_enabled=category_drops_enabled,
+                    limit=self.wildcard_category_streamer_limit,
+                    sort_by=category_sort,
+                    tracking=False,
+                )
+                for username, slugs in discovered_slugs_by_username.items():
+                    category_slugs_by_username.setdefault(username, set()).update(slugs)
 
                 for username in all_wildcard_category_usernames:
                     wildcard_category_usernames.add(username)
@@ -980,6 +1037,11 @@ class TwitchChannelPointsMiner:
                         from_wildcard_category=is_wildcard_category_streamer,
                         explicitly_configured=(
                             username in explicitly_configured_usernames
+                        ),
+                        discovery_category_slugs=(
+                            category_slugs_by_username.get(username)
+                            if is_category_streamer is True
+                            else None
                         ),
                     )
                 )
@@ -1584,44 +1646,64 @@ class TwitchChannelPointsMiner:
                 )
 
         discovered_usernames = []
-        discovery_failed = False
+        # The badge game(s) each channel was found under, so a later failed
+        # lookup keeps only that game's channels.
+        game_slugs_by_username = {}
+        # Badge games whose lookup failed (with the Twitch game slug it
+        # resolved to, when known): not evaluated this check.
+        failed_game_slugs = set()
+
+        def record_found(game_slug, usernames):
+            discovered_usernames.extend(usernames)
+            for username in usernames:
+                username = str(username).lower().strip()
+                if username:
+                    game_slugs_by_username.setdefault(username, set()).add(game_slug)
+
+        def record_failure(game_slug, error):
+            failed_game_slugs.add(game_slug)
+            if getattr(error, "game_slug", None):
+                failed_game_slugs.add(error.game_slug)
+            # A lookup that failed part-way still reports what it found.
+            record_found(game_slug, getattr(error, "usernames", None) or ())
+
         for game_slug in dict.fromkeys(unrestricted_games):
             try:
-                discovered_usernames.extend(
-                    self.twitch.get_live_streamers_for_category(
-                        game_slug,
-                        drops_enabled=True,
-                        limit=self.badge_drop_streamer_limit,
-                        sort_by=self.badge_drop_category_sort,
-                        respect_campaign_restrictions=False,
-                    )
+                found = self.twitch.get_live_streamers_for_category(
+                    game_slug,
+                    drops_enabled=True,
+                    limit=self.badge_drop_streamer_limit,
+                    sort_by=self.badge_drop_category_sort,
+                    respect_campaign_restrictions=False,
                 )
             except Exception as error:
-                discovery_failed = True
+                record_failure(game_slug, error)
                 logger.warning(
                     f"Unable to find a live channel for badge Drop campaign "
                     f"'{game_slug}': {error}",
                     extra={"emoji": ":warning:", "category_log": True},
                 )
+            else:
+                record_found(game_slug, found)
 
         for game_slug, restricted_campaigns in restricted_campaigns_by_game.items():
             try:
-                discovered_usernames.extend(
-                    self.twitch.get_live_streamers_for_category(
-                        game_slug,
-                        drops_enabled=True,
-                        limit=30,
-                        sort_by=self.badge_drop_category_sort,
-                        restricted_campaigns=restricted_campaigns,
-                    )
+                found = self.twitch.get_live_streamers_for_category(
+                    game_slug,
+                    drops_enabled=True,
+                    limit=30,
+                    sort_by=self.badge_drop_category_sort,
+                    restricted_campaigns=restricted_campaigns,
                 )
             except Exception as error:
-                discovery_failed = True
+                record_failure(game_slug, error)
                 logger.warning(
                     f"Unable to find restricted live channels for badge Drop "
                     f"campaign '{game_slug}': {error}",
                     extra={"emoji": ":warning:", "category_log": True},
                 )
+            else:
+                record_found(game_slug, found)
 
         added = 0
         earned_badge_changed = (
@@ -1630,21 +1712,47 @@ class TwitchChannelPointsMiner:
             and owned_badges != previous_owned_badges
         )
         with self.config_reload_lock:
+            # Bounded like the category lookups: a game whose lookup never
+            # recovers must not keep its stale channels forever.
+            unevaluated_game_slugs = self.__expire_unevaluated_slugs(
+                "badge",
+                failed_game_slugs,
+                checks="badge Drop checks",
+                consequence="",
+                limit=BADGE_LOOKUP_FAILURE_LIMIT,
+                label="Badge game lookups",
+            )
             # Badge channels the latest check no longer returns are retired,
             # or every check (limit 1, often a random sort) adds another one.
             # The current Drops pick stays among the results while it is live
             # in its game. A failed lookup returns nothing for its game, so
-            # only an ownership change retires channels after one.
-            if earned_badge_changed or not discovery_failed:
-                self.__reconcile_badge_campaign_streamers(
-                    discovered_usernames, earned_badge_changed=earned_badge_changed
-                )
-            existing_usernames = {streamer.username for streamer in self.streamers}
+            # that game's channels are kept, unless the earned badges changed.
+            self.__reconcile_badge_campaign_streamers(
+                discovered_usernames,
+                earned_badge_changed=earned_badge_changed,
+                unevaluated_game_slugs=(
+                    () if earned_badge_changed else unevaluated_game_slugs
+                ),
+            )
+            existing_streamers = {
+                streamer.username: streamer for streamer in self.streamers
+            }
             for username in dict.fromkeys(discovered_usernames):
                 username = str(username).lower().strip()
+                existing = existing_streamers.get(username)
+                if (
+                    existing is not None
+                    and existing.from_badge_campaign is True
+                    and username in game_slugs_by_username
+                ):
+                    # Replace, as category discovery does: the games it was
+                    # found under this check are the ones to judge it by.
+                    existing.discovery_category_slugs = set(
+                        game_slugs_by_username[username]
+                    )
                 if (
                     not username
-                    or username in existing_usernames
+                    or existing is not None
                     or username in self.badge_drop_blacklist
                 ):
                     continue
@@ -1659,6 +1767,7 @@ class TwitchChannelPointsMiner:
                         ),
                         from_category=True,
                         from_badge_campaign=True,
+                        discovery_category_slugs=game_slugs_by_username.get(username),
                     )
                     streamer.channel_id = self.twitch.get_channel_id(username)
                     streamer.settings = set_default_settings(
@@ -1678,7 +1787,7 @@ class TwitchChannelPointsMiner:
                     self.twitch.check_streamer_online(streamer)
                     self.streamers.append(streamer)
                     self.original_streamers.append(streamer.channel_points)
-                    existing_usernames.add(username)
+                    existing_streamers[username] = streamer
                     added += 1
 
                     self.ws_pool.submit(
@@ -1799,14 +1908,25 @@ class TwitchChannelPointsMiner:
         )
 
     def __reconcile_badge_campaign_streamers(
-        self, discovered_usernames, earned_badge_changed=True
+        self, discovered_usernames, earned_badge_changed=True, unevaluated_game_slugs=()
     ):
-        """Retire badge-only channels absent from the latest badge discovery."""
+        """Retire badge-only channels absent from the latest badge discovery.
+
+        Channels of `unevaluated_game_slugs` (badge games whose lookup failed
+        this check) are kept: their absence says nothing about whether they
+        are stale.
+        """
         discovered = {
             str(username).lower().strip()
             for username in discovered_usernames
             if str(username).strip()
         }
+
+        def in_unevaluated_game(streamer):
+            if not unevaluated_game_slugs:
+                return False
+            return self.__streamer_in_categories(streamer, unevaluated_game_slugs)
+
         retained = []
         retained_baselines = []
         removed = []
@@ -1819,6 +1939,7 @@ class TwitchChannelPointsMiner:
             if (
                 streamer.from_badge_campaign is not True
                 or streamer.username in discovered
+                or in_unevaluated_game(streamer)
             ):
                 retained.append(streamer)
                 retained_baselines.append(baseline)
@@ -1861,7 +1982,28 @@ class TwitchChannelPointsMiner:
                 extra={"emoji": ":next_track_button:", "category_log": True},
             )
 
-    def __reconcile_category_streamers(self, discovered_usernames, wildcard=False):
+    def __streamer_in_categories(self, streamer, category_slugs):
+        """Whether a tracked streamer belongs to one of `category_slugs`.
+
+        The categories it was last discovered under are recorded on the
+        streamer and decide on their own: a streamer stale in a category that
+        did refresh is not kept just because it now streams a game whose
+        lookup failed. The game of the stream it was last seen in is only the
+        fallback for streamers tracked from before that was recorded.
+        """
+        if not category_slugs:
+            return False
+        recorded = streamer.discovery_category_slugs
+        if recorded:
+            return not recorded.isdisjoint(category_slugs)
+        game_name = streamer.stream.game_name()
+        if not game_name:
+            return False
+        return self.twitch.get_game_name_slug(game_name) in category_slugs
+
+    def __reconcile_category_streamers(
+        self, discovered_usernames, wildcard=False, unevaluated_category_slugs=()
+    ):
         """Retire category-only channels absent from the latest discovery.
 
         Scoped by `wildcard` so a preferred-category refresh only retires
@@ -1869,6 +2011,10 @@ class TwitchChannelPointsMiner:
         wildcard-discovered ones -- the two discovery passes run independently
         and must not evict each other's streamers just for being absent from
         the other pass's discovery list.
+
+        Streamers in `unevaluated_category_slugs` are kept regardless: their
+        category's live-channel lookup failed this cycle, so their absence
+        from the discovery list says nothing about whether they are stale.
         """
         discovered = {
             str(username).lower().strip()
@@ -1891,7 +2037,11 @@ class TwitchChannelPointsMiner:
                 if wildcard
                 else StreamerSource.CATEGORIES
             ) in discovery_sources(streamer)
-            if not in_scope or streamer.username in discovered:
+            if (
+                not in_scope
+                or streamer.username in discovered
+                or self.__streamer_in_categories(streamer, unevaluated_category_slugs)
+            ):
                 retained.append(streamer)
                 retained_baselines.append(baseline)
                 continue
@@ -1961,15 +2111,183 @@ class TwitchChannelPointsMiner:
             self.streamers[index] = streamer
             self.original_streamers[index] = baseline
 
-    def __add_discovered_category_streamers(
-        self, discovered_usernames, blacklist, category_chat, wildcard=False
+    def __lookup_campaign_categories(
+        self, label, lookup, track_failures=False, count_failures=True
     ):
-        existing_usernames = {streamer.username for streamer in self.streamers}
+        """Run one discovery filter (`lookup`, a no-argument call) for the
+        `label` pass ("configured" or "wildcard").
+
+        Returns (categories, unevaluated_category_slugs, failed). The filter
+        resets the slugs it reports as not evaluated on every call, so they
+        are read here, right after it returns. A campaign lookup that failed
+        outright is logged and reported as failed, with no categories.
+        track_failures applies the same consecutive-failure limit as
+        live-channel lookups to the outage (count_failures as in
+        __expire_unevaluated_slugs). Once the limit is reached, an outage
+        counts as evaluated empty until recovery.
+        """
+        failed = False
+        unevaluated_slugs = set()
+        try:
+            categories = lookup()
+        except CategoryLookupFailedException as error:
+            logger.warning(
+                f"Unable to look up drop campaigns for {label} categories: {error}",
+                extra={"emoji": ":warning:", "category_log": True},
+            )
+            categories = []
+            failed = True
+        else:
+            unevaluated_slugs = self.__unevaluated_filter_category_slugs()
+        if track_failures:
+            # A total outage has no per-category result. Bound the whole pass
+            # instead, including tracked channels whose game is not known yet.
+            failed = bool(
+                self.__expire_unevaluated_slugs(
+                    f"{label}_campaigns",
+                    {f"all {label} categories"} if failed else set(),
+                    count=count_failures,
+                )
+            )
+        return categories, unevaluated_slugs, failed
+
+    def __expire_unevaluated_slugs(
+        self,
+        kind,
+        unevaluated_slugs,
+        count=True,
+        checks="refreshes",
+        consequence=" and wildcard discovery can run",
+        limit=CATEGORY_LOOKUP_FAILURE_LIMIT,
+        label="Category lookups",
+    ):
+        """`unevaluated_slugs` without the categories that have now stayed
+        unevaluated for `limit` refreshes in a row.
+
+        Those are treated as evaluated from then on, so their stale streamers
+        are retired and wildcard discovery can run again, until their lookup
+        succeeds and the count starts over. `kind` keeps the preferred and
+        wildcard passes' counts apart. With count=False (a refresh triggered
+        by a config change, not the schedule) a failure does not add to the
+        count, so quick edits during an outage cannot use up its allowance; a
+        success still resets it.
+        """
+        streaks = self.category_lookup_failure_streaks
+        previous = streaks.get(kind, {})
+        step = 1 if count else 0
+        current = {slug: previous.get(slug, 0) + step for slug in unevaluated_slugs}
+        streaks[kind] = current
+        expired = {slug for slug, streak in current.items() if streak >= limit}
+        newly_expired = sorted(
+            slug for slug in expired if count and current[slug] == limit
+        )
+        if newly_expired:
+            logger.warning(
+                f"{label} for {', '.join(newly_expired)} failed "
+                f"{limit} {checks} in a row; treating "
+                "them as evaluated so their stale streamers can be retired"
+                f"{consequence}",
+                extra={"emoji": ":warning:", "category_log": True},
+            )
+        return set(unevaluated_slugs) - expired
+
+    def __unevaluated_filter_category_slugs(self):
+        """Category slugs the latest discovery filter call reported as not
+        evaluated (its Twitch campaign lookup failed and no other source
+        covered them). Empty for a fully evaluated pass."""
+        return set(self.twitch.unevaluated_category_slugs)
+
+    def __discover_live_category_streamers(
+        self, categories, drops_enabled, limit, sort_by, tracking=True
+    ):
+        """Look up the live channels of each category in turn.
+
+        Returns (usernames, unevaluated_category_slugs, category_slugs_by_username).
+        A category whose lookup failed is recorded in
+        `unevaluated_category_slugs` (its configured slug and the Twitch game
+        slug it resolves to), so the reconcile can keep that category's
+        streamers while still retiring stale ones from categories that did
+        refresh; channels a paginated lookup found before failing are still
+        returned in `usernames`. `category_slugs_by_username` records the
+        configured slug each channel was discovered under, for the Streamer.
+        `tracking` is False at startup, when nothing is tracked yet and a
+        failed category is simply skipped.
+        """
+        usernames = []
+        unevaluated_category_slugs = set()
+        category_slugs_by_username = {}
+        for category in categories:
+            category_slugs = self.twitch.get_category_slugs([category])
+            try:
+                discovered = self.twitch.get_live_streamers_for_category(
+                    category,
+                    drops_enabled=drops_enabled,
+                    limit=limit,
+                    sort_by=sort_by,
+                )
+            except CategoryLookupFailedException as error:
+                discovered = error.usernames
+                unevaluated_category_slugs.update(category_slugs)
+                if error.game_slug:
+                    unevaluated_category_slugs.add(error.game_slug)
+                consequence = (
+                    "its tracked streamers are kept until the next refresh"
+                    if tracking
+                    else "it is skipped until the next refresh"
+                )
+                if discovered:
+                    consequence += (
+                        f"; the {len(discovered)} live channels found before the "
+                        "failure are still added"
+                    )
+                logger.warning(
+                    f"Unable to look up live channels for category "
+                    f"'{category}': {error}; {consequence}",
+                    extra={"emoji": ":warning:", "category_log": True},
+                )
+            for username in discovered:
+                username = str(username).lower().strip()
+                if username:
+                    category_slugs_by_username.setdefault(username, set()).update(
+                        category_slugs
+                    )
+            usernames.extend(discovered)
+        return usernames, unevaluated_category_slugs, category_slugs_by_username
+
+    def __add_discovered_category_streamers(
+        self,
+        discovered_usernames,
+        blacklist,
+        category_chat,
+        wildcard=False,
+        category_slugs_by_username=None,
+    ):
+        existing_streamers = {
+            streamer.username: streamer for streamer in self.streamers
+        }
         blacklist_usernames = {str(username).lower().strip() for username in blacklist}
+        category_slugs_by_username = category_slugs_by_username or {}
         added = 0
         for username in dict.fromkeys(discovered_usernames):
             username = username.lower().strip()
-            if username in existing_usernames or username in blacklist_usernames:
+            if username in blacklist_usernames:
+                continue
+            existing = existing_streamers.get(username)
+            if existing is not None:
+                # Replace rather than accumulate: the categories this pass
+                # found the streamer under this cycle are the ones its
+                # reconcile should judge it by, and a category it has left
+                # must not keep shielding it. Only the pass that owns the
+                # streamer records them; the other pass's reconcile never
+                # judges it.
+                new_slugs = category_slugs_by_username.get(username)
+                owner = (
+                    StreamerSource.WILDCARD_CATEGORIES
+                    if wildcard
+                    else StreamerSource.CATEGORIES
+                )
+                if new_slugs and owner in discovery_sources(existing):
+                    existing.discovery_category_slugs = set(new_slugs)
                 continue
 
             try:
@@ -1982,6 +2300,7 @@ class TwitchChannelPointsMiner:
                     ),
                     from_category=True,
                     from_wildcard_category=wildcard,
+                    discovery_category_slugs=category_slugs_by_username.get(username),
                 )
                 streamer.channel_id = self.twitch.get_channel_id(username)
                 streamer.settings = set_default_settings(
@@ -2001,7 +2320,7 @@ class TwitchChannelPointsMiner:
                 self.twitch.check_streamer_online(streamer)
                 self.streamers.append(streamer)
                 self.original_streamers.append(streamer.channel_points)
-                existing_usernames.add(username)
+                existing_streamers[username] = streamer
                 added += 1
 
                 self.ws_pool.submit(
@@ -2042,7 +2361,14 @@ class TwitchChannelPointsMiner:
         wildcard_category_limit=10,
         wildcard_category_streamer_limit=1,
         wildcard_category_pin_active=True,
+        count_failures=True,
     ):
+        """Rediscover category streamers and retire stale ones.
+
+        count_failures=False for a refresh a config change triggered: its
+        lookup failures do not count toward CATEGORY_LOOKUP_FAILURE_LIMIT
+        (see __expire_unevaluated_slugs).
+        """
         logger.log(
             category_log_level,
             "Refreshing configured categories and drop campaigns",
@@ -2070,25 +2396,66 @@ class TwitchChannelPointsMiner:
             discovery_inventory is not None
             and not Twitch.drops_inventory_loaded(discovery_inventory)
         )
-        eligible_categories = self.twitch.filter_categories_with_active_drops(
-            categories,
-            order=campaign_order,
-            drops_enabled=drops_enabled,
-            inventory=discovery_inventory,
+        # The same goes for a campaign lookup that failed outright (every
+        # Twitch campaign source down in one cycle): the filter raises instead
+        # of returning an empty list, and this cycle evaluates nothing.
+        (
+            eligible_categories,
+            filter_unevaluated_slugs,
+            campaign_lookup_failed,
+        ) = self.__lookup_campaign_categories(
+            "configured",
+            lambda: self.twitch.filter_categories_with_active_drops(
+                categories,
+                order=campaign_order,
+                drops_enabled=drops_enabled,
+                inventory=discovery_inventory,
+            ),
         )
-        discovered_usernames = []
-        for category in eligible_categories:
-            discovered_usernames.extend(
-                self.twitch.get_live_streamers_for_category(
-                    category,
-                    drops_enabled=drops_enabled,
-                    limit=limit,
-                    sort_by=sort_by,
-                )
+        # Bounded like every other lookup failure: an outage that never ends
+        # (an expired or revoked token breaks the inventory along with the
+        # Helix lookups) must not keep stale streamers forever. Past the limit
+        # the empty discovery counts as evaluated, so they are retired. Both
+        # causes share one count, so outages alternating between them are
+        # still cut off.
+        discovery_unavailable = bool(
+            self.__expire_unevaluated_slugs(
+                "discovery",
+                (
+                    {"category discovery (drops inventory or campaign lookup)"}
+                    if inventory_unavailable or campaign_lookup_failed
+                    else set()
+                ),
+                count=count_failures,
+            )
+        )
+        # A failed live-channel lookup for one category is handled per
+        # category instead: that category's streamers are excluded from the
+        # reconcile below, while the others still retire genuinely stale ones.
+        (
+            discovered_usernames,
+            unevaluated_category_slugs,
+            category_slugs_by_username,
+        ) = self.__discover_live_category_streamers(
+            eligible_categories,
+            drops_enabled=drops_enabled,
+            limit=limit,
+            sort_by=sort_by,
+        )
+        # Requested categories the campaign lookup could not evaluate (a
+        # secondary source covered the others) are not stale either.
+        unevaluated_category_slugs |= filter_unevaluated_slugs
+        if not discovery_unavailable:
+            unevaluated_category_slugs = self.__expire_unevaluated_slugs(
+                "preferred", unevaluated_category_slugs, count=count_failures
             )
 
         added = self.__add_discovered_category_streamers(
-            discovered_usernames, blacklist, category_chat, wildcard=False
+            discovered_usernames,
+            blacklist,
+            category_chat,
+            wildcard=False,
+            category_slugs_by_username=category_slugs_by_username,
         )
 
         # Wildcard discovery only runs once the preferred pass leaves
@@ -2115,14 +2482,21 @@ class TwitchChannelPointsMiner:
         # disabling `categories`). Wildcard discovery also stands down when
         # the drops inventory failed to load: it can't evaluate campaigns
         # without it, so its empty result would wrongly retire every tracked
-        # wildcard streamer.
+        # wildcard streamer. Likewise when its own campaign lookup fails, and
+        # while any preferred category is unevaluated: the preferred pass then
+        # found nothing only because it could not look, and wildcard streamers
+        # added meanwhile would never be reconciled once it recovers and the
+        # wildcard pass stands down again.
         wildcard_discovery_ran = (
             wildcard_categories
             and not discovered_usernames
-            and not inventory_unavailable
+            and not discovery_unavailable
+            and not unevaluated_category_slugs
         )
-        wildcard_standing_down = wildcard_categories and not wildcard_discovery_ran
         wildcard_discovered_usernames = []
+        unevaluated_wildcard_slugs = set()
+        wildcard_slugs_by_username = {}
+        wildcard_lookup_failed = False
         if wildcard_discovery_ran:
             pinned_category_slugs = {
                 self.twitch.get_game_name_slug(streamer.stream.game_name())
@@ -2131,8 +2505,21 @@ class TwitchChannelPointsMiner:
                 and streamer.is_online
                 and streamer.stream.game_name()
             }
-            wildcard_eligible_categories = (
-                self.twitch.get_wildcard_categories_with_active_drops(
+            # A streamer whose stream has not reported a game yet is still
+            # known by the category it was discovered under.
+            tracked_wildcard_slugs = {
+                slug
+                for streamer in self.streamers
+                if streamer.from_wildcard_category is True
+                for slug in streamer.discovery_category_slugs or ()
+            }
+            (
+                wildcard_eligible_categories,
+                wildcard_filter_unevaluated_slugs,
+                wildcard_lookup_failed,
+            ) = self.__lookup_campaign_categories(
+                "wildcard",
+                lambda: self.twitch.get_wildcard_categories_with_active_drops(
                     exclude_category_slugs=self.twitch.get_category_slugs(categories),
                     drops_enabled=drops_enabled,
                     limit=wildcard_category_limit,
@@ -2140,32 +2527,54 @@ class TwitchChannelPointsMiner:
                     pin_active=wildcard_category_pin_active,
                     inventory=discovery_inventory,
                     refresh_external_catalog=True,
-                )
+                    tracked_category_slugs=tracked_wildcard_slugs,
+                ),
+                track_failures=True,
+                count_failures=count_failures,
             )
-            for category in wildcard_eligible_categories:
-                wildcard_discovered_usernames.extend(
-                    self.twitch.get_live_streamers_for_category(
-                        category,
-                        drops_enabled=drops_enabled,
-                        limit=wildcard_category_streamer_limit,
-                        sort_by=sort_by,
-                    )
+            if wildcard_lookup_failed:
+                wildcard_discovery_ran = False
+            (
+                wildcard_discovered_usernames,
+                unevaluated_wildcard_slugs,
+                wildcard_slugs_by_username,
+            ) = self.__discover_live_category_streamers(
+                wildcard_eligible_categories,
+                drops_enabled=drops_enabled,
+                limit=wildcard_category_streamer_limit,
+                sort_by=sort_by,
+            )
+            unevaluated_wildcard_slugs |= wildcard_filter_unevaluated_slugs
+            if wildcard_discovery_ran:
+                unevaluated_wildcard_slugs = self.__expire_unevaluated_slugs(
+                    "wildcard", unevaluated_wildcard_slugs, count=count_failures
                 )
+        wildcard_standing_down = wildcard_categories and not wildcard_discovery_ran
 
         added += self.__add_discovered_category_streamers(
-            wildcard_discovered_usernames, blacklist, category_chat, wildcard=True
+            wildcard_discovered_usernames,
+            blacklist,
+            category_chat,
+            wildcard=True,
+            category_slugs_by_username=wildcard_slugs_by_username,
         )
 
         # Keep the previous category set available while replacement channels
         # are initialized so the minute watcher cannot observe a partial refresh.
         # Disabled `categories` still reconciles against the empty list, so
         # turning the setting off retires its streamers even mid-outage.
-        if not (categories and inventory_unavailable):
-            self.__reconcile_category_streamers(discovered_usernames, wildcard=False)
+        if not (categories and discovery_unavailable):
+            self.__reconcile_category_streamers(
+                discovered_usernames,
+                wildcard=False,
+                unevaluated_category_slugs=unevaluated_category_slugs,
+            )
             self.__order_category_streamers(discovered_usernames, wildcard=False)
         if not wildcard_standing_down:
             self.__reconcile_category_streamers(
-                wildcard_discovered_usernames, wildcard=True
+                wildcard_discovered_usernames,
+                wildcard=True,
+                unevaluated_category_slugs=unevaluated_wildcard_slugs,
             )
             self.__order_category_streamers(
                 wildcard_discovered_usernames, wildcard=True
@@ -2179,23 +2588,33 @@ class TwitchChannelPointsMiner:
             self.sync_campaigns_thread.name = "Sync campaigns/inventory"
             self.sync_campaigns_thread.start()
 
-        if inventory_unavailable:
+        if discovery_unavailable:
             # Replaces the summary below, which would read "0 active
             # categories" as if discovery had succeeded with nothing to find.
+            reason = (
+                "drops inventory unavailable"
+                if inventory_unavailable
+                else "drop campaign lookup failed"
+            )
             logger.log(
                 category_log_level,
-                "Category discovery skipped: drops inventory unavailable; "
+                f"Category discovery skipped: {reason}; "
                 "streamers from enabled category settings are kept until the next refresh",
                 extra={"emoji": ":pause_button:", "category_log": True},
             )
             return
 
         unique_wildcard_discovered = len(dict.fromkeys(wildcard_discovered_usernames))
+        wildcard_summary = (
+            # Distinct from a genuine "0 discovered": nothing was evaluated.
+            "wildcard pass stood down (drop campaign lookup failed)"
+            if wildcard_lookup_failed
+            else f"{unique_wildcard_discovered} wildcard streamer(s) discovered"
+        )
         logger.log(
             category_log_level,
             f"Category refresh complete: {len(eligible_categories)} active categories, "
-            f"{unique_wildcard_discovered} wildcard streamer(s) discovered, "
-            f"{added} new streamers",
+            f"{wildcard_summary}, {added} new streamers",
             extra={"emoji": ":white_check_mark:", "category_log": True},
         )
 
@@ -2361,6 +2780,7 @@ class TwitchChannelPointsMiner:
                     self.wildcard_category_streamer_limit
                 ),
                 wildcard_category_pin_active=self.wildcard_category_pin_active,
+                count_failures=False,
             )
 
     def end(self, signum, frame):

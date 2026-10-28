@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from TwitchChannelPointsMiner.TwitchChannelPointsMiner import (
+    BADGE_LOOKUP_FAILURE_LIMIT,
     TwitchChannelPointsMiner,
 )
 from TwitchChannelPointsMiner.classes.Chat import ChatPresence
@@ -46,6 +47,7 @@ class FakeCatalog:
 class FakeTwitch:
     def __init__(self):
         self.selectors = []
+        self.unevaluated_category_slugs = set()
         self.twitch_login = SimpleNamespace(
             get_auth_token=lambda: "token",
         )
@@ -63,6 +65,9 @@ class FakeTwitch:
 
     def filter_categories_with_active_drops(self, categories, **_kwargs):
         return categories
+
+    def get_category_slugs(self, categories):
+        return set(categories)
 
     def get_drops_inventory(self):
         return self._record({"present": True, "completedRewardCampaigns": []})
@@ -120,6 +125,8 @@ def test_auto_mine_badge_campaigns_adds_drop_streamers_and_honors_blacklist():
     Settings.streamer_settings = defaults
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     miner.username = "testuser"
     miner.twitch = FakeTwitch()
     miner.streamers = []
@@ -178,10 +185,17 @@ def _badge_check_miner(twitch):
     Settings.streamer_settings = defaults
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     miner.username = "testuser"
     miner.twitch = twitch
     miner.streamers = [
-        Streamer("previous-random", from_category=True, from_badge_campaign=True)
+        Streamer(
+            "previous-random",
+            from_category=True,
+            from_badge_campaign=True,
+            discovery_category_slugs={"restricted-game"},
+        )
     ]
     miner.original_streamers = [10]
     miner.ws_pool = FakeWebSocketsPool()
@@ -226,8 +240,120 @@ def test_failed_badge_lookup_does_not_retire_badge_channels():
     assert miner.ws_pool.removed == []
 
 
+class RestrictedGameFailingTwitch(FakeTwitch):
+    """The restricted badge game's lookup keeps failing; the all-channel game
+    is evaluated and has nobody live."""
+
+    def get_live_streamers_for_category(self, selector, **kwargs):
+        if kwargs.get("restricted_campaigns"):
+            from TwitchChannelPointsMiner.classes.Exceptions import (
+                CategoryLookupFailedException,
+            )
+
+            raise CategoryLookupFailedException(
+                "directory errors", game_slug="restricted-game"
+            )
+        return []
+
+
+def _badge_streamer_in(username, game_slug):
+    return Streamer(
+        username,
+        from_category=True,
+        from_badge_campaign=True,
+        discovery_category_slugs={game_slug},
+    )
+
+
+def test_failed_badge_game_does_not_shield_channels_of_evaluated_games():
+    miner = _badge_check_miner(RestrictedGameFailingTwitch())
+    evaluated = _badge_streamer_in("evaluated-stale", "all-channel-game")
+    failed = _badge_streamer_in("failed-game", "restricted-game")
+    miner.streamers = [evaluated, failed]
+    miner.original_streamers = [10, 20]
+
+    miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+
+    assert miner.streamers == [failed]
+    assert miner.original_streamers == [20]
+    assert miner.ws_pool.removed == ["evaluated-stale"]
+
+
+def test_badge_game_that_keeps_failing_retires_its_channels_after_the_limit(caplog):
+    miner = _badge_check_miner(RestrictedGameFailingTwitch())
+    failed = _badge_streamer_in("failed-game", "restricted-game")
+    miner.streamers.append(failed)
+    miner.original_streamers.append(20)
+
+    for _ in range(BADGE_LOOKUP_FAILURE_LIMIT - 1):
+        miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+    assert [streamer.username for streamer in miner.streamers] == [
+        "previous-random",
+        "failed-game",
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+
+    assert miner.streamers == []
+    assert miner.ws_pool.removed == ["previous-random", "failed-game"]
+    assert (
+        f"Badge game lookups for restricted-game failed "
+        f"{BADGE_LOOKUP_FAILURE_LIMIT} badge Drop checks in a row"
+    ) in caplog.text
+
+
+def test_badge_game_lookup_success_restarts_the_failure_limit():
+    class RecoveringTwitch(RestrictedGameFailingTwitch):
+        recovered = False
+
+        def get_live_streamers_for_category(self, selector, **kwargs):
+            if self.recovered:
+                return []
+            return super().get_live_streamers_for_category(selector, **kwargs)
+
+    twitch = RecoveringTwitch()
+    miner = _badge_check_miner(twitch)
+    miner.streamers = [_badge_streamer_in("failed-game", "restricted-game")]
+    miner.original_streamers = [20]
+
+    for _ in range(BADGE_LOOKUP_FAILURE_LIMIT - 1):
+        miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+    twitch.recovered = True
+    miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+    assert miner.ws_pool.removed == ["failed-game"]
+
+    # A channel rediscovered after the recovery gets the full allowance again.
+    twitch.recovered = False
+    miner.streamers = [_badge_streamer_in("failed-game", "restricted-game")]
+    miner.original_streamers = [20]
+    for _ in range(BADGE_LOOKUP_FAILURE_LIMIT - 1):
+        miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+    assert [streamer.username for streamer in miner.streamers] == ["failed-game"]
+
+
+def test_badge_channels_record_the_game_they_were_found_under():
+    miner = _badge_check_miner(FakeTwitch())
+    rediscovered = _badge_streamer_in("allowedchannel", "old-game")
+    miner.streamers = [rediscovered]
+    miner.original_streamers = [10]
+
+    miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+
+    slugs = {
+        streamer.username: streamer.discovery_category_slugs
+        for streamer in miner.streamers
+    }
+    assert slugs == {
+        "allowedchannel": {"restricted-game"},
+        "allchannel": {"all-channel-game"},
+        "blacklisted": {"all-channel-game"},
+    }
+
+
 def test_badge_ownership_change_retires_only_stale_badge_streamers():
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+    miner.category_lookup_failure_streaks = {}
     stale = Streamer(
         "stale",
         from_category=True,
@@ -285,6 +411,8 @@ def test_badge_retirement_never_exposes_retiring_streamers_as_configured():
             )
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     miner.streamers = [
         Streamer("first-retired", from_category=True, from_badge_campaign=True),
         Streamer("second-retired", from_category=True, from_badge_campaign=True),
@@ -321,6 +449,8 @@ def test_badge_inventory_failure_preserves_baseline_for_next_refresh():
             return []
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     stale = Streamer(
         "stale",
         from_category=True,
@@ -616,6 +746,48 @@ def test_auto_mine_badge_campaigns_uses_cache_when_inventory_raises():
     assert miner.ws_pool.removed == ["previous-random"]
 
 
+def test_auto_mine_badge_campaigns_adds_channels_a_failed_lookup_still_found():
+    from TwitchChannelPointsMiner.classes.Exceptions import (
+        CategoryLookupFailedException,
+    )
+
+    class PartialTwitch(FakeTwitch):
+        def get_live_streamers_for_category(self, selector, **kwargs):
+            self.selectors.append((selector, kwargs))
+            if kwargs.get("restricted_campaigns"):
+                raise CategoryLookupFailedException(
+                    "second batch failed", usernames=["partialchannel"]
+                )
+            return ["allchannel"]
+
+    defaults = StreamerSettings(chat=ChatPresence.NEVER)
+    defaults.default()
+    defaults.bet.default()
+    Settings.streamer_settings = defaults
+    miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+    miner.category_lookup_failure_streaks = {}
+    miner.username = "testuser"
+    miner.twitch = PartialTwitch()
+    miner.streamers = []
+    miner.original_streamers = []
+    miner.ws_pool = FakeWebSocketsPool()
+    miner.drop_badge_catalog = FakeCatalog()
+    miner.badge_inventory_state = None
+    miner.badge_drop_streamer_limit = 2
+    miner.badge_drop_category_chat = ChatPresence.NEVER
+    miner.badge_drop_category_sort = "VIEWERS_DESC"
+    miner.badge_drop_blacklist = set()
+    miner.config_reload_lock = threading.Lock()
+    miner.sync_campaigns_thread = object()
+
+    miner._TwitchChannelPointsMiner__auto_mine_badge_campaigns()
+
+    assert [streamer.username for streamer in miner.streamers] == [
+        "allchannel",
+        "partialchannel",
+    ]
+
+
 def test_category_discovery_keeps_point_baselines_aligned():
     defaults = StreamerSettings(chat=ChatPresence.NEVER)
     defaults.default()
@@ -623,6 +795,8 @@ def test_category_discovery_keeps_point_baselines_aligned():
     Settings.streamer_settings = defaults
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     miner.username = "testuser"
     miner.twitch = FakeTwitch()
     miner.streamers = []
@@ -651,6 +825,7 @@ def test_category_discovery_keeps_point_baselines_aligned():
 
 def test_category_refresh_retires_streamers_missing_from_latest_discovery():
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+    miner.category_lookup_failure_streaks = {}
     stale = Streamer("stale", from_category=True)
     current = Streamer("allchannel", from_category=True)
     miner.streamers = [stale, current]
@@ -668,6 +843,7 @@ def test_category_refresh_retires_streamers_missing_from_latest_discovery():
 
 def test_category_refresh_preserves_other_sources_when_category_is_stale():
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+    miner.category_lookup_failure_streaks = {}
     configured = Streamer(
         "configured",
         from_category=True,
@@ -698,6 +874,7 @@ def test_category_refresh_leaves_badge_streamer_flags_when_category_is_stale():
     # marker (which keeps it gated by drop eligibility).
     for wildcard in (False, True):
         miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+        miner.category_lookup_failure_streaks = {}
         badge = Streamer("badge", from_category=True, from_badge_campaign=True)
         miner.streamers = [badge]
         miner.original_streamers = [30]
@@ -720,6 +897,8 @@ def test_category_refresh_reorders_existing_streamers_to_latest_priority():
     Settings.streamer_settings = defaults
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     lower_priority = Streamer("blacklisted", from_category=True)
     explicit = Streamer("explicit", explicitly_configured=True)
     higher_priority = Streamer("allchannel", from_category=True)
@@ -748,6 +927,7 @@ def test_category_refresh_reorders_existing_streamers_to_latest_priority():
 
 def test_category_refresh_reorder_repairs_missing_baselines():
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+    miner.category_lookup_failure_streaks = {}
     lower_priority = Streamer("lower", from_category=True)
     higher_priority = Streamer("higher", from_category=True)
     lower_priority.channel_points = 10
@@ -779,6 +959,8 @@ def test_category_refresh_adds_replacements_before_retiring_stale_streamers():
             )
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     stale = Streamer("stale", from_category=True)
     miner.username = "testuser"
     miner.streamers = [stale]
@@ -822,6 +1004,8 @@ def test_rediscovered_category_streamer_is_checked_before_it_can_be_watched():
     Settings.streamer_settings = defaults
 
     miner = TwitchChannelPointsMiner.__new__(TwitchChannelPointsMiner)
+
+    miner.category_lookup_failure_streaks = {}
     miner.username = "testuser"
     miner.twitch = FakeTwitch()
     miner.streamers = []

@@ -1,11 +1,12 @@
 import copy
 import json
 import logging
-
-import pytest
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
+from TwitchChannelPointsMiner.classes.Exceptions import CategoryLookupFailedException
 from TwitchChannelPointsMiner.classes.Twitch import Twitch
 from TwitchChannelPointsMiner.classes.gql.Errors import RetryError
 from TwitchChannelPointsMiner.classes.Settings import Settings
@@ -14,6 +15,8 @@ from TwitchChannelPointsMiner.classes.TwitchDropsApp import TwitchDropsAppScrape
 
 def bare_twitch(gql):
     twitch = object.__new__(Twitch)
+    twitch.campaign_lookup_unavailable = False
+    twitch.unevaluated_category_slugs = set()
     twitch.gql = gql
     twitch.available_badge_names = None
     twitch.completed_badge_campaign_signature_cache = None
@@ -51,11 +54,11 @@ def test_restricted_campaign_lookup_stops_after_total_live_limit(monkeypatch):
     monkeypatch.setattr(Twitch, "_Twitch__helix_get", helix_get)
     campaigns = [
         {
-            "channels": [f"streamer-{index}" for index in range(250)],
+            "channels": [f"streamer_{index}" for index in range(250)],
         }
     ]
 
-    usernames, _ = twitch._Twitch__get_live_restricted_campaign_streamers(
+    usernames, _, _unverified = twitch._Twitch__get_live_restricted_campaign_streamers(
         campaigns,
         "game-1",
         "Special Events",
@@ -77,7 +80,7 @@ def test_restricted_campaign_lookup_trusts_campaign_channel_allowlist(monkeypatc
         lambda self, endpoint, params: {
             "data": [
                 {
-                    "user_login": "ravenquest-channel",
+                    "user_login": "ravenquest_channel",
                     "game_id": "ravenquest-id",
                     "viewer_count": 25,
                     "tags": ["Português", "DropsAtivados"],
@@ -86,13 +89,13 @@ def test_restricted_campaign_lookup_trusts_campaign_channel_allowlist(monkeypatc
         },
     )
 
-    usernames, _ = twitch._Twitch__get_live_restricted_campaign_streamers(
-        [{"channels": ["ravenquest-channel"]}],
+    usernames, _, _unverified = twitch._Twitch__get_live_restricted_campaign_streamers(
+        [{"channels": ["ravenquest_channel"]}],
         "ravenquest-id",
         "RavenQuest",
     )
 
-    assert usernames == ["ravenquest-channel"]
+    assert usernames == ["ravenquest_channel"]
 
 
 def test_drops_directory_filter_uses_twitch_tag_id(monkeypatch):
@@ -143,6 +146,20 @@ def test_drops_directory_filter_does_not_trust_user_tag_text(monkeypatch):
     assert twitch._Twitch__get_drops_enabled_directory_logins("game") == set()
 
 
+def test_drops_directory_request_failure_raises_instead_of_empty_set():
+    # Issue #175: an empty set means "no Drops-enabled channel is live" and
+    # retires the category's streamers; a failed request must not look alike.
+    def post_gql_request_raw(operation, request):
+        raise RetryError("DirectoryPage_Game", [])
+
+    twitch = bare_twitch(SimpleNamespace(post_gql_request_raw=post_gql_request_raw))
+
+    with pytest.raises(CategoryLookupFailedException) as error:
+        twitch._Twitch__get_drops_enabled_directory_logins("game")
+
+    assert error.value.game_slug == "game"
+
+
 def test_special_events_restricted_lookup_accepts_other_game_categories(monkeypatch):
     twitch = bare_twitch(SimpleNamespace())
 
@@ -152,7 +169,7 @@ def test_special_events_restricted_lookup_accepts_other_game_categories(monkeypa
         lambda self, endpoint, params: {
             "data": [
                 {
-                    "user_login": "ewc-channel",
+                    "user_login": "ewc_channel",
                     "game_id": "another-esports-game",
                     "viewer_count": 100,
                     "tags": ["DropsEnabled"],
@@ -161,15 +178,15 @@ def test_special_events_restricted_lookup_accepts_other_game_categories(monkeypa
         },
     )
 
-    usernames, _ = twitch._Twitch__get_live_restricted_campaign_streamers(
-        [{"channels": ["ewc-channel"]}],
+    usernames, _, _unverified = twitch._Twitch__get_live_restricted_campaign_streamers(
+        [{"channels": ["ewc_channel"]}],
         "special-events-id",
         "Special Events",
         target_per_campaign=30,
         max_total=30,
     )
 
-    assert usernames == ["ewc-channel"]
+    assert usernames == ["ewc_channel"]
 
 
 def test_normal_restricted_lookup_still_requires_matching_game(monkeypatch):
@@ -190,7 +207,7 @@ def test_normal_restricted_lookup_still_requires_matching_game(monkeypatch):
         },
     )
 
-    usernames, _ = twitch._Twitch__get_live_restricted_campaign_streamers(
+    usernames, _, _unverified = twitch._Twitch__get_live_restricted_campaign_streamers(
         [{"channels": ["wrong-game-channel"]}],
         "expected-game",
         "Expected Game",
@@ -203,11 +220,9 @@ def test_normal_restricted_lookup_still_requires_matching_game(monkeypatch):
 
 def test_badge_streamer_uses_special_events_eligibility_across_categories():
     twitch = bare_twitch(SimpleNamespace())
-    twitch.category_campaign_eligibility = {
-        ("special-events", "ewc-channel"): (1, 2)
-    }
+    twitch.category_campaign_eligibility = {("special-events", "ewc_channel"): (1, 2)}
     streamer = SimpleNamespace(
-        username="ewc-channel",
+        username="ewc_channel",
         from_category=True,
         from_badge_campaign=True,
         is_online=True,
@@ -226,11 +241,9 @@ def test_badge_streamer_that_is_also_configured_still_uses_special_events():
     # STREAMERS or FOLLOWERS (its highest-priority tier) must not skip the
     # special-events eligibility fallback.
     twitch = bare_twitch(SimpleNamespace())
-    twitch.category_campaign_eligibility = {
-        ("special-events", "ewc-channel"): (1, 2)
-    }
+    twitch.category_campaign_eligibility = {("special-events", "ewc_channel"): (1, 2)}
     streamer = SimpleNamespace(
-        username="ewc-channel",
+        username="ewc_channel",
         from_category=True,
         from_badge_campaign=True,
         from_followers=True,
