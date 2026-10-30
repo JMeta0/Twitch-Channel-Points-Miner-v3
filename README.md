@@ -1471,7 +1471,8 @@ The log viewer polls every `log_poll_interval` seconds (default `5`; accepted
 range `1` to `180`), and `days_ago` controls the chart's initial time range.
 
 For access from another machine, bind to `0.0.0.0` and provide a strong
-`password`; remote binds without a password are rejected. Sign in with the
+`password`; remote binds without a password are rejected unless
+`trust_proxy_auth=True` is set (see below). Sign in with the
 configured Twitch username and analytics password. The built-in server uses
 plain HTTP, so expose it only on a trusted network or behind an HTTPS reverse
 proxy. Background and design context are available in [issue #96](https://github.com/Tkd-Alex/Twitch-Channel-Points-Miner-v2/issues/96).
@@ -1518,6 +1519,26 @@ behind that proxy. Restrict the proxy further with a firewall, VPN, or IP
 allowlist where possible. nginx and certificate provisioning must be configured
 for your operating system and domain; the example only shows the relevant proxy
 boundary.
+
+If an authenticating reverse proxy (for example Authelia or oauth2-proxy behind
+Traefik) is the only way to reach the analytics server, set
+`trust_proxy_auth=True` instead of a password:
+
+```python
+ANALYTICS_CONFIG = {
+    "host": "0.0.0.0",
+    "port": 54455,
+    "trust_proxy_auth": True,
+}
+```
+
+This disables the built-in HTTP Basic authentication and enables the Config
+tab without an analytics password, so users only authenticate through the
+proxy. It does not verify that a request actually came through the proxy:
+enable it only when the analytics port is unreachable any other way (no
+published container port, no host firewall hole, and no untrusted containers
+on the same network). Anything that can reach the miner directly then has full
+access to analytics data, logs, and configuration.
 
 ### Enabling analytics storage
 
