@@ -1348,6 +1348,7 @@ of these values in each provider's `events` list.
 | `claim_drops` | bool | `True` | Accumulate Drop watch progress and claim available Drops. |
 | `claim_moments` | bool | `True` | Claim available [Moments](https://help.twitch.tv/s/article/moments). |
 | `watch_streak` | bool | `True` | Prioritize available watch-streak rewards. |
+| `streak_only` | bool or int | `False` | Watch the channel only for its watch streak: each broadcast is watched for at most ~10 minutes (or the integer number of minutes given as the value) and the channel is left once the streak is claimed, so no extra watch-time points are farmed there. A counted broadcast needs only a few minutes, so multi-broadcast streaks advance without camping the whole stream. |
 | `favorite` | bool | `False` | Prioritize this streamer when `Priority.FAVORITE` is configured. |
 | `points_limit` | int or None | `None` | Stop watching at this balance, except for an eligible pending watch streak. |
 | `community_goals` | bool | `False` | Contribute the maximum allowed points to community goals. |

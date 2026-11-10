@@ -105,6 +105,7 @@ class StreamerSettings(object):
         "claim_drops",
         "claim_moments",
         "watch_streak",
+        "streak_only",
         "favorite",
         "points_limit",
         "community_goals",
@@ -119,6 +120,7 @@ class StreamerSettings(object):
         claim_drops: bool = None,
         claim_moments: bool = None,
         watch_streak: bool = None,
+        streak_only: bool = None,
         favorite: bool = None,
         points_limit: int = None,
         community_goals: bool = None,
@@ -130,6 +132,7 @@ class StreamerSettings(object):
         self.claim_drops = claim_drops
         self.claim_moments = claim_moments
         self.watch_streak = watch_streak
+        self.streak_only = streak_only
         self.favorite = favorite
         self.points_limit = points_limit
         self.community_goals = community_goals
@@ -150,13 +153,15 @@ class StreamerSettings(object):
             self.community_goals = False
         if self.favorite is None:
             self.favorite = False
+        if self.streak_only is None:
+            self.streak_only = False
         if self.bet is None:
             self.bet = BetSettings()
         if self.chat is None:
             self.chat = ChatPresence.ONLINE
 
     def __repr__(self):
-        return f"StreamerSettings(make_predictions={self.make_predictions}, follow_raid={self.follow_raid}, claim_drops={self.claim_drops}, claim_moments={self.claim_moments}, watch_streak={self.watch_streak}, favorite={self.favorite}, points_limit={self.points_limit}, community_goals={self.community_goals}, bet={self.bet}, chat={self.chat})"
+        return f"StreamerSettings(make_predictions={self.make_predictions}, follow_raid={self.follow_raid}, claim_drops={self.claim_drops}, claim_moments={self.claim_moments}, watch_streak={self.watch_streak}, streak_only={self.streak_only}, favorite={self.favorite}, points_limit={self.points_limit}, community_goals={self.community_goals}, bet={self.bet}, chat={self.chat})"
 
 
 class Streamer(object):
