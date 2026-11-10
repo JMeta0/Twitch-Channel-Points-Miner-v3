@@ -135,6 +135,7 @@ ANALYTICS_CONFIG_DEFAULTS = (
     ("days_ago", "7"),
     ("password", "None"),
     ("log_poll_interval", "5"),
+    ("trust_proxy_auth", "False"),
 )
 
 
