@@ -1466,7 +1466,9 @@ The **Config** tab manages explicit streamers, categories and their order,
 per-streamer behavior, category discovery, stream sources, logging, daily
 reports, and notification providers. Streamer additions/removals and category
 list changes are detected by the running miner; controls marked in the page as
-restart-required take effect on the next start.
+restart-required take effect on the next start, or immediately through the
+**Restart now** button at the bottom of the Config tab (the in-process
+restart the dashboard already uses for reauthentication).
 
 Dashboard changes are written directly to their canonical `STREAMERS`,
 `MINER_CONFIG`, and `MINE_CONFIG` values in `config.py`; unrelated source and

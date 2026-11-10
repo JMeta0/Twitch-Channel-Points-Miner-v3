@@ -445,6 +445,75 @@ def test_restart_process_relaunches_frozen_executable(monkeypatch):
     assert calls == [("miner.exe", ["miner.exe", "--example"])]
 
 
+def test_restart_process_rebuilds_module_invocation(monkeypatch):
+    # Container ENTRYPOINT `python -m TwitchChannelPointsMiner.runner`: the
+    # -m form is not in sys.argv, so it must be reconstructed or the relaunched
+    # script resolves the same-named module file instead of the package.
+    calls = []
+    monkeypatch.setattr(runner.sys, "executable", "/usr/local/bin/python")
+    monkeypatch.setattr(
+        runner.sys,
+        "argv",
+        ["/usr/src/app/TwitchChannelPointsMiner/runner.py", "--config-dir", "/cfg"],
+    )
+    monkeypatch.setitem(
+        runner.sys.modules,
+        "__main__",
+        SimpleNamespace(
+            __spec__=SimpleNamespace(name="TwitchChannelPointsMiner.runner")
+        ),
+    )
+    monkeypatch.setattr(
+        runner.os,
+        "execv",
+        lambda executable, args: calls.append((executable, args)),
+    )
+
+    runner.restart_process()
+
+    assert calls == [
+        (
+            "/usr/local/bin/python",
+            [
+                "/usr/local/bin/python",
+                "-u",
+                "-m",
+                "TwitchChannelPointsMiner.runner",
+                "--config-dir",
+                "/cfg",
+            ],
+        )
+    ]
+
+
+def test_restart_process_falls_back_to_script_invocation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner.sys, "executable", "/usr/local/bin/python")
+    monkeypatch.setattr(
+        runner.sys, "argv", ["/usr/local/bin/twitch-miner-runner", "--example"]
+    )
+    monkeypatch.setitem(runner.sys.modules, "__main__", SimpleNamespace(__spec__=None))
+    monkeypatch.setattr(
+        runner.os,
+        "execv",
+        lambda executable, args: calls.append((executable, args)),
+    )
+
+    runner.restart_process()
+
+    assert calls == [
+        (
+            "/usr/local/bin/python",
+            [
+                "/usr/local/bin/python",
+                "-u",
+                "/usr/local/bin/twitch-miner-runner",
+                "--example",
+            ],
+        )
+    ]
+
+
 def test_drop_progress_report_entries_only_returns_session_changes():
     unchanged = {
         "item_name": "Unchanged",

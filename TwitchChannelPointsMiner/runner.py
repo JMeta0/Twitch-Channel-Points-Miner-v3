@@ -280,6 +280,19 @@ def restart_process():
     """Replace the current process, preserving frozen executable arguments."""
     if getattr(sys, "frozen", False):
         return os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+    # Under `python -m TwitchChannelPointsMiner.runner` (the container
+    # ENTRYPOINT) sys.argv[0] is the module's file path, and the `-m` form is
+    # lost from argv. Re-execing that path as a plain script puts the package
+    # directory itself on sys.path[0], where `import TwitchChannelPointsMiner`
+    # resolves the same-named module file instead of the package and dies on a
+    # circular import. Rebuild the -m invocation when the process was started
+    # that way.
+    main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    if getattr(main_spec, "name", None) == "TwitchChannelPointsMiner.runner":
+        return os.execv(
+            sys.executable,
+            [sys.executable, "-u", "-m", main_spec.name, *sys.argv[1:]],
+        )
     return os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
 
 
