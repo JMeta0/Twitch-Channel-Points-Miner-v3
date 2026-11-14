@@ -2,6 +2,7 @@ import os
 
 import pytest
 
+from TwitchChannelPointsMiner.constants import WATCH_STREAK_STREAM_GAP_SECONDS
 from TwitchChannelPointsMiner.history.store import (
     DEFAULT_RETENTION_DAYS,
     HistoryStore,
@@ -201,7 +202,7 @@ def test_streamers_flag_streak_claimed_during_the_current_live(store):
     assert item["live_streak_at"] == NOW + 60
 
 
-def test_streamers_hide_streak_from_a_previous_broadcast(store):
+def test_streamers_keep_streak_across_a_short_restart(store):
     store.upsert_stream_session("alice", "b1", NOW, ended_at=NOW + 100)
     store.record_event(
         "alice",
@@ -210,9 +211,69 @@ def test_streamers_hide_streak_from_a_previous_broadcast(store):
         "Watch streak claimed",
         metadata={"broadcast_id": "b1", "started_at": NOW},
     )
+    # A restart less than 30 minutes after the previous broadcast ended is the
+    # same stream for watch-streak purposes.
     store.upsert_stream_session("alice", "b2", NOW + 200)
 
     item = _streamer_rows(store, NOW + 300)["alice"]
+    assert item["live_stream"]["broadcast_id"] == "b2"
+    assert item["last_streak_at"] == NOW + 60
+    assert item["live_streak_at"] == NOW + 60
+
+
+def test_streamers_keep_streak_across_chained_short_restarts(store):
+    store.upsert_stream_session("alice", "b1", NOW, ended_at=NOW + 100)
+    store.record_event(
+        "alice",
+        NOW + 60,
+        "watch_streak",
+        "Watch streak claimed",
+        metadata={"broadcast_id": "b1", "started_at": NOW},
+    )
+    store.upsert_stream_session("alice", "b2", NOW + 200, ended_at=NOW + 300)
+    store.upsert_stream_session("alice", "b3", NOW + 400)
+
+    item = _streamer_rows(store, NOW + 500)["alice"]
+    assert item["live_stream"]["broadcast_id"] == "b3"
+    assert item["live_streak_at"] == NOW + 60
+
+
+def test_streamers_hide_streak_after_a_long_restart(store):
+    store.upsert_stream_session("alice", "b1", NOW, ended_at=NOW + 100)
+    store.record_event(
+        "alice",
+        NOW + 60,
+        "watch_streak",
+        "Watch streak claimed",
+        metadata={"broadcast_id": "b1", "started_at": NOW},
+    )
+    store.upsert_stream_session(
+        "alice",
+        "b2",
+        NOW + 100 + WATCH_STREAK_STREAM_GAP_SECONDS,
+    )
+
+    item = _streamer_rows(store, NOW + 2000)["alice"]
+    assert item["live_stream"]["broadcast_id"] == "b2"
+    assert item["last_streak_at"] == NOW + 60
+    assert item["live_streak_at"] is None
+
+
+def test_streamers_hide_streak_after_an_unobserved_restart(store):
+    # The previous broadcast was still open, so upsert_stream_session() closes
+    # it at the next broadcast's start. That inferred zero gap is not proof of
+    # a short restart and must not carry the old claim over.
+    store.upsert_stream_session("alice", "b1", NOW)
+    store.record_event(
+        "alice",
+        NOW + 60,
+        "watch_streak",
+        "Watch streak claimed",
+        metadata={"broadcast_id": "b1", "started_at": NOW},
+    )
+    store.upsert_stream_session("alice", "b2", NOW + 1000)
+
+    item = _streamer_rows(store, NOW + 1100)["alice"]
     assert item["live_stream"]["broadcast_id"] == "b2"
     assert item["last_streak_at"] == NOW + 60
     assert item["live_streak_at"] is None

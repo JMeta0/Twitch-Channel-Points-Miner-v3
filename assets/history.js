@@ -635,7 +635,7 @@
                     escapeHtml(reasonLabel(item.active_watch.reason)) + '</span>');
             }
             if (item.live_streak_at) {
-                badges.push('<span class="tag is-warning is-light" title="Streak claimed this live: ' +
+                badges.push('<span class="tag is-warning is-light" title="Streak claimed this stream: ' +
                     escapeHtml(formatTime(item.live_streak_at)) + '">streak</span>');
             }
             return '<tr>' +
