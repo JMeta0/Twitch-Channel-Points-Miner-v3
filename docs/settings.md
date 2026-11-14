@@ -26,6 +26,9 @@ channel-points balance reaches that value. A pending watch streak can temporaril
 bypass the limit so its reward is not missed. Set `favorite=True` per streamer
 and include `Priority.FAVORITE` to reserve watch slots for favorites first.
 
+See [Watch streaks](watch-streak.md) for the pending-streak checks, logical
+streams, and the `streak_only` option.
+
 ## Android login
 
 By default the miner logs in as Twitch's TV app. Twitch withholds some Drops
@@ -171,6 +174,7 @@ of these values in each provider's `events` list.
 | `claim_drops` | bool | `True` | Accumulate Drop watch progress and claim available Drops. |
 | `claim_moments` | bool | `True` | Claim available [Moments](https://help.twitch.tv/s/article/moments). |
 | `watch_streak` | bool | `True` | Prioritize available watch-streak rewards. |
+| `streak_only` | bool or int | `False` | Watch the channel only for its watch streak: at most ~10 minutes per broadcast (or the integer number of minutes given), then leave it until the streak is claimed. See [Watch streaks](watch-streak.md). |
 | `favorite` | bool | `False` | Prioritize this streamer when `Priority.FAVORITE` is configured. |
 | `points_limit` | int or None | `None` | Stop watching at this balance, except for an eligible pending watch streak. |
 | `community_goals` | bool | `False` | Contribute the maximum allowed points to community goals. |
