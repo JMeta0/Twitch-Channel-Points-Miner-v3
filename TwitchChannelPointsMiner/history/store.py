@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from TwitchChannelPointsMiner.constants import WATCH_STREAK_STREAM_GAP_SECONDS
+
 HISTORY_SCHEMA_VERSION = 1
 DEFAULT_RETENTION_DAYS = 730
 SECONDS_PER_DAY = 24 * 60 * 60
@@ -64,24 +66,80 @@ def _event_broadcast_id(raw_metadata):
     return broadcast_id or None
 
 
-def _live_streak_at(claims, live_stream):
-    """Return when a streak was claimed during ``live_stream``, if at all.
+def _logical_stream_window(live_stream, streams):
+    """Return the broadcast ids and start time of the current logical stream.
+
+    Twitch treats a broadcast that starts less than 30 minutes after the
+    previous one ended as the same stream for watch-streak purposes.  Walk
+    backwards through the recorded broadcasts so a streak claimed on any part
+    of that chain covers the current broadcast.
+    """
+
+    broadcast_id = str(live_stream.get("broadcast_id") or "").strip()
+    broadcast_ids = {broadcast_id} if broadcast_id else set()
+    try:
+        current_started_at = float(live_stream.get("started_at"))
+    except (TypeError, ValueError):
+        current_started_at = 0.0
+    logical_started_at = current_started_at
+
+    for previous in reversed(streams or []):
+        previous_broadcast_id = str(previous.get("broadcast_id") or "").strip()
+        if not previous_broadcast_id or previous_broadcast_id == broadcast_id:
+            continue
+        try:
+            previous_started_at = float(previous.get("started_at"))
+        except (TypeError, ValueError):
+            continue
+        ended_at = previous.get("ended_at")
+        if ended_at is None:
+            break
+        try:
+            previous_ended_at = float(ended_at)
+        except (TypeError, ValueError):
+            break
+        if previous_started_at >= current_started_at:
+            continue
+        # An inferred end (the previous row was closed when the next broadcast
+        # started) gives a zero gap. Do not use it to continue the stream:
+        # only an observed offline transition proves the two parts are close.
+        gap = current_started_at - previous_ended_at
+        if gap <= 0 or gap >= WATCH_STREAK_STREAM_GAP_SECONDS:
+            break
+        broadcast_ids.add(previous_broadcast_id)
+        current_started_at = previous_started_at
+        logical_started_at = previous_started_at
+
+    return broadcast_ids, logical_started_at
+
+
+def _live_streak_at(claims, live_stream, broadcast_ids=None, logical_started_at=None):
+    """Return the streak claim covering the current logical stream, if any.
 
     Streak events written from the streak cache carry the broadcast id, so a
-    claim from an earlier broadcast can never light up the current one.  Older
-    events predating that metadata fall back to a timestamp comparison.
+    claim is matched against every broadcast in the current logical stream.
+    Older events predating that metadata fall back to a timestamp comparison
+    against the start of the logical stream.
     """
 
     if not claims:
         return None
-    broadcast_id = str(live_stream.get("broadcast_id") or "").strip()
-    started_at = live_stream.get("started_at")
+    if broadcast_ids is None:
+        broadcast_id = str(live_stream.get("broadcast_id") or "").strip()
+        broadcast_ids = {broadcast_id} if broadcast_id else set()
+    if logical_started_at is None:
+        try:
+            logical_started_at = float(live_stream.get("started_at"))
+        except (TypeError, ValueError):
+            logical_started_at = None
     matched = None
     for timestamp, claim_broadcast_id in claims:
         if claim_broadcast_id is not None:
-            is_current = bool(broadcast_id) and claim_broadcast_id == broadcast_id
+            is_current = claim_broadcast_id in broadcast_ids
         else:
-            is_current = started_at is not None and timestamp >= float(started_at)
+            is_current = (
+                logical_started_at is not None and timestamp >= logical_started_at
+            )
         if is_current:
             matched = timestamp if matched is None else max(matched, timestamp)
     return matched
@@ -1009,6 +1067,7 @@ class HistoryStore(object):
                            title, game
                     FROM streams WHERE ended_at IS NULL
                     """).fetchall()}
+            stream_history = {}
             last_streak = {row["streamer"]: row["ts"] for row in connection.execute("""
                     SELECT streamer, MAX(ts) AS ts FROM events
                     WHERE type = 'watch_streak' GROUP BY streamer
@@ -1016,6 +1075,16 @@ class HistoryStore(object):
             streak_claims = {}
             if live_streams:
                 placeholders = ",".join("?" for _ in live_streams)
+                for row in connection.execute(
+                    f"""
+                    SELECT streamer, broadcast_id, started_at, ended_at
+                    FROM streams
+                    WHERE streamer IN ({placeholders})
+                    ORDER BY streamer, started_at, id
+                    """,
+                    tuple(live_streams),
+                ).fetchall():
+                    stream_history.setdefault(row["streamer"], []).append(dict(row))
                 for row in connection.execute(
                     f"""
                     SELECT streamer, ts, metadata FROM events
@@ -1035,11 +1104,18 @@ class HistoryStore(object):
             item["active_watch"] = active_watch.get(streamer)
             item["live_stream"] = live_streams.get(streamer)
             item["last_streak_at"] = last_streak.get(streamer)
-            item["live_streak_at"] = (
-                _live_streak_at(streak_claims.get(streamer), item["live_stream"])
-                if item["live_stream"] is not None
-                else None
-            )
+            if item["live_stream"] is not None:
+                broadcast_ids, logical_started_at = _logical_stream_window(
+                    item["live_stream"], stream_history.get(streamer)
+                )
+                item["live_streak_at"] = _live_streak_at(
+                    streak_claims.get(streamer),
+                    item["live_stream"],
+                    broadcast_ids=broadcast_ids,
+                    logical_started_at=logical_started_at,
+                )
+            else:
+                item["live_streak_at"] = None
             observed = [item.get("last_seen")]
             if item["active_watch"] is not None:
                 observed.append(item["active_watch"].get("last_seen_at"))
